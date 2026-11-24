@@ -1,114 +1,138 @@
 import { expect, test } from 'claude-code/testing'
 
-import { DEFAULT_PREFS, EMPTY_VIEW, asPrefs, blockReason, gaugeSvg, level, pace, prune, rateFrom, room, sampleOf, sparkline, split, summarize } from './usage'
+import type { Sync } from '../types'
+import { DEFAULT_PREFS, EMPTY_VIEW, asPrefs, blockReason, gaugeSvg, level, pace, plan, prune, rateFrom, sampleOf, sparkline, summarize } from './usage'
+import { parseGist, pcName, sharesFor } from './sync'
 
 const NOW = Date.parse('2026-11-24T12:00:00Z')
 const MIN = 60_000
 const resetsAt = new Date(NOW + 2 * 60 * MIN).toISOString() // window began 3h ago
-const P = DEFAULT_PREFS // limit 60, no share
+const P = { ...DEFAULT_PREFS, share: 70 }
+const status = (over: Partial<Sync['pcs'][string]> = {}) => ({ t: NOW - 60 * MIN, busy: false, updated: NOW - MIN, mine: 0, resetsAt, samples: [], ...over })
+const synced = (other: Partial<Sync['pcs'][string]>, shares = { A: 70, B: 30 }): Sync => ({
+  me: 'A',
+  error: null,
+  at: NOW - MIN,
+  shares,
+  pcs: { A: status(), B: status(other) },
+})
 
-test('15-minute usage, this PC share, week and graph points', async () => {
+test('own usage: cost × rate, last 15 min, line over the window', async () => {
   const log = [
-    { t: NOW - 60 * MIN, tok: 1000, out: 10, pct: 20, d: 5 },
-    { t: NOW - 20 * MIN, tok: 2000, out: 20, pct: 30, d: 2.5 },
-    { t: NOW - 10 * MIN, tok: 3000, out: 30, pct: 34 },
-    { t: NOW - 2 * MIN, tok: 4000, out: 40, pct: 37.5, d: 1 },
+    { t: NOW - 60 * MIN, tok: 1000, out: 10, pct: 20, usd: 2 },
+    { t: NOW - 10 * MIN, tok: 3000, out: 30, pct: 34, usd: 1 },
+    { t: NOW - 2 * MIN, tok: 4000, out: 40, pct: 37, usd: 0.5 },
   ]
-  const v = summarize(log, { pct: 37.5, resetsAt, week: 23 }, NOW, 1.234)
-  expect(v.pct).toBe(37.5)
-  expect(v.pct15).toBe(7.5)
+  const v = summarize(log, { pct: 37, resetsAt, week: 23 }, NOW, 1.25, 2)
+  expect(v.mine).toBe(7)
+  expect(v.mine15).toBe(3)
   expect(v.tokens15).toBe(7000)
-  expect(v.out15).toBe(70)
-  expect(v.tokensWindow).toBe(10000)
-  expect(v.mine).toBe(8.5)
   expect(v.week).toBe(23)
-  expect(v.cost).toBe(1.234)
-  expect(v.points[0]).toEqual([0, 0])
-  expect(v.points.at(-1)).toEqual([0.6, 37.5])
-})
-
-test('a window that already reset reads 0% and drops older turns', async () => {
-  const old = new Date(NOW - MIN).toISOString()
-  const v = summarize([{ t: NOW - 6 * 60 * MIN, tok: 5, out: 1, pct: 90, d: 9 }], { pct: 90, resetsAt: old }, NOW)
-  expect(v.pct).toBe(0)
-  expect(v.tokensWindow).toBe(0)
-  expect(v.mine).toBe(0)
-})
-
-test('pace forecast', async () => {
-  const v = { ...EMPTY_VIEW, pct: 40, resetsAt, pct15: 5 }
-  // 20% left at 5% per 15 min = 60 min, before the reset in 2h
-  expect(pace(v, P, NOW)).toEqual({ text: 'stop in ~1h 0m', isSoon: false })
-  expect(pace({ ...v, pct15: 10 }, P, NOW).isSoon).toBe(true)
-  expect(pace({ ...v, pct15: 1 }, P, NOW).text).toBe('safe until reset')
-  expect(pace({ ...v, pct15: 0 }, P, NOW).text).toBe('no use in 15 min')
-  expect(pace(EMPTY_VIEW, P, NOW).text).toBe('waiting for first reply')
-})
-
-test('blocking: account limit, snooze; warning levels', async () => {
-  const v = { ...EMPTY_VIEW, pct: 61, resetsAt }
-  expect(blockReason(v, P, NOW)).toContain('61%')
-  expect(blockReason(v, { ...P, snoozeUntil: NOW + MIN }, NOW)).toBe(null)
-  expect(level({ ...v, pct: 47 }, P)).toBe(0)
-  expect(level({ ...v, pct: 48 }, P)).toBe(1)
-  expect(level({ ...v, pct: 60 }, P)).toBe(2)
-})
-
-test('split: idle other use gives the full limit; busy splits by work, 20..80', async () => {
-  const v = { ...EMPTY_VIEW, pct: 30, resetsAt, mine: 25, mine30: 3 }
-  expect(split({ ...v, other30: 0.2 }, P)).toEqual({ weight: 1, isOtherBusy: false })
-  expect(split({ ...v, other30: 1 }, P).weight).toBe(0.75)
-  expect(split({ ...v, other30: 30 }, P).weight).toBe(0.2)
-  expect(split({ ...v, mine30: 30, other30: 1 }, P).weight).toBe(0.8)
-  expect(split({ ...v, other30: 30 }, { ...P, split: false }).weight).toBe(1)
-  // other busy, this PC's part is 12% of 60 and it used 25: stopped though the account is at 30
-  expect(room({ ...v, other30: 30 }, P)).toEqual({ left: 0, cap: 12, isPartTighter: true })
-  expect(blockReason({ ...v, other30: 30 }, P, NOW)).toContain("this PC's part is 12%")
-  // other idle: only the account limit counts
-  expect(room({ ...v, other30: 0 }, P).left).toBe(30)
-})
-
-test('rate: lower quartile of samples; tiny turns give none', async () => {
-  expect(rateFrom([])).toBe(null)
-  expect(rateFrom([4, 1, 3, 2, 10])).toBe(2)
-  expect(sampleOf(0.2, 1)).toBe(null)
-  expect(sampleOf(1, 0.5)).toBe(2)
-})
-
-test('cost-based mine, other use spread over the gap', async () => {
-  // This PC: two turns 3h ago costing $2 each at 2%/$ = 8%. Then idle; account went 8 -> 28 over 2h50m while away.
-  const log = [
-    { t: NOW - 180 * MIN, tok: 1, out: 1, pct: 4, usd: 2 },
-    { t: NOW - 175 * MIN, tok: 1, out: 1, pct: 8, usd: 2 },
-    { t: NOW - 5 * MIN, tok: 1, out: 1, pct: 29, usd: 0.5 },
-  ]
-  const v = summarize(log, { pct: 29, resetsAt }, NOW, null, 2)
-  expect(v.mine).toBe(9)
-  expect(v.mine30).toBe(1)
-  // 20% of other use over 170 min, 25 of them in the last 30 min
-  expect(v.other30).toBe(2.9)
-  expect(v.isCalibrated).toBe(true)
-  // Uncalibrated, the turn's seen rise (d) stands in
+  expect(v.points.at(-1)).toEqual([0.6, 7])
+  // no rate yet: the rise seen during the turn stands in
   expect(summarize([{ t: NOW - MIN, tok: 1, out: 1, pct: 5, d: 1.5, usd: 9 }], { pct: 5, resetsAt }, NOW).mine).toBe(1.5)
 })
 
-test('stored prefs: bad values fall back, the old limit key carries over', async () => {
+test('a window that already reset reads 0%', async () => {
+  const old = new Date(NOW - MIN).toISOString()
+  const v = summarize([{ t: NOW - 6 * 60 * MIN, tok: 5, out: 1, pct: 90, usd: 9 }], { pct: 90, resetsAt: old }, NOW, null, 2)
+  expect(v.pct).toBe(0)
+  expect(v.mine).toBe(0)
+})
+
+test('shares: 70 here means 30 there; this PC stops at its own share', async () => {
+  expect(sharesFor('A', 70, ['B'])).toEqual({ A: 70, B: 30 })
+  const v = { ...EMPTY_VIEW, pct: 40, resetsAt, mine: 30 }
+  const s = synced({ t: NOW - 5 * MIN, mine: 10 })
+  const pl = plan(v, P, s, NOW)
+  expect(pl.share).toBe(70)
+  expect(pl.cap).toBe(70)
+  expect(pl.left).toBe(40)
+  expect(pl.isLending).toBe(false)
+  expect(pl.others[0]).toEqual({ name: 'B', share: 30, mine: 10, isWorking: false, idleMs: 5 * MIN })
+  // at its share: stopped, even though the account has room
+  expect(blockReason({ ...v, mine: 70 }, P, plan({ ...v, mine: 70 }, P, s, NOW), NOW)).toContain('its 70% share')
+  // the synced share wins over the local setting
+  expect(plan(v, P, synced({}, { A: 60, B: 40 }), NOW).share).toBe(60)
+})
+
+test('working now, idle, lending', async () => {
+  const v = { ...EMPTY_VIEW, pct: 50, resetsAt, mine: 45 }
+  // other PC working: no lending
+  const working = plan(v, P, synced({ busy: true, updated: NOW - MIN, t: NOW - 40 * MIN }), NOW)
+  expect(working.others[0]!.isWorking).toBe(true)
+  expect(working.isLending).toBe(false)
+  // a "working" flag 10 min old is stale: that PC closed mid-turn
+  expect(plan(v, P, synced({ busy: true, updated: NOW - 10 * MIN, t: NOW - 40 * MIN }), NOW).others[0]!.isWorking).toBe(false)
+  // idle 40 min with 5% used: this PC may go to 95%
+  const lend = plan({ ...v, mine: 75 }, P, synced({ t: NOW - 40 * MIN, mine: 5 }), NOW)
+  expect(lend.isLending).toBe(true)
+  expect(lend.cap).toBe(95)
+  expect(lend.left).toBe(20) // the account's room (100 - 80... pct 50) vs cap 95-75 = 20
+  // idle only 10 min: no lending yet
+  expect(plan(v, P, synced({ t: NOW - 10 * MIN }), NOW).isLending).toBe(false)
+})
+
+test('not synced: local share, no lending', async () => {
+  const v = { ...EMPTY_VIEW, pct: 50, resetsAt, mine: 20 }
+  const offline: Sync = { ...synced({ t: NOW - 3 * 60 * MIN }), error: 'GitHub did not answer' }
+  const pl = plan(v, P, offline, NOW)
+  expect(pl.synced).toBe(false)
+  expect(pl.isLending).toBe(false)
+  expect(pl.cap).toBe(70)
+  // stale sync data counts as not synced
+  expect(plan(v, P, { ...synced({}), at: NOW - 20 * MIN }, NOW).synced).toBe(false)
+})
+
+test('pace, warning level', async () => {
+  const s = synced({ t: NOW - 5 * MIN })
+  const v = { ...EMPTY_VIEW, pct: 40, resetsAt, mine: 50, mine15: 5 }
+  const pl = plan(v, P, s, NOW)
+  expect(pace(v, pl, NOW)).toEqual({ text: 'stop in ~1h 0m', isSoon: false })
+  expect(pace({ ...v, mine15: 1 }, pl, NOW).text).toBe('safe until reset')
+  expect(pace(EMPTY_VIEW, plan(EMPTY_VIEW, P, s, NOW), NOW).text).toBe('waiting for first reply')
+  expect(level({ ...v, mine: 55 }, plan({ ...v, mine: 55 }, P, s, NOW))).toBe(0)
+  expect(level({ ...v, mine: 56 }, plan({ ...v, mine: 56 }, P, s, NOW))).toBe(1)
+  expect(level({ ...v, mine: 70 }, plan({ ...v, mine: 70 }, P, s, NOW))).toBe(2)
+})
+
+test('rate: median of samples; whole-% readings need a 1% rise', async () => {
+  expect(rateFrom([])).toBe(null)
+  expect(rateFrom([4, 1, 3, 2, 10])).toBe(3)
+  expect(rateFrom([2, 4])).toBe(3)
+  expect(sampleOf(0.5, 1)).toBe(null)
+  expect(sampleOf(2, 1)).toBe(2)
+})
+
+test('gist files: bad content is ignored, names are made safe', async () => {
+  const g = parseGist({
+    'shares.json': { content: JSON.stringify({ shares: { A: 70, B: 30, C: 500 } }) },
+    'pc-A.json': { content: JSON.stringify({ t: 5, busy: true, updated: 6, mine: 12.5, resetsAt, samples: [2, -1, 'x'] }) },
+    'pc-B.json': { content: 'not json' },
+    'notes.txt': { content: 'hi' },
+  })
+  expect(g.shares).toEqual({ A: 70, B: 30 })
+  expect(Object.keys(g.pcs)).toEqual(['A'])
+  expect(g.pcs.A!.samples).toEqual([2])
+  expect(pcName(' DESKTOP 7/Q \n')).toBe('DESKTOP-7-Q')
+})
+
+test('stored prefs: the old limit carries over as the share', async () => {
   expect(asPrefs(undefined)).toEqual(DEFAULT_PREFS)
-  expect(asPrefs(undefined, 45).limit).toBe(45)
-  expect(asPrefs({ limit: 'x', onePass: 'yes' })).toEqual(DEFAULT_PREFS)
-  expect(asPrefs({ limit: 80, split: false }).split).toBe(false)
+  expect(asPrefs({ limit: 70, split: true }).share).toBe(70)
+  expect(asPrefs({ share: 'x', onePass: 'yes' })).toEqual(DEFAULT_PREFS)
   expect(prune([{ t: NOW - 6 * 60 * MIN, tok: 1, out: 1, pct: 1 }], NOW)).toEqual([])
 })
 
-test('drawing: rings, limit line, usage line, sparkline', async () => {
-  const empty = gaugeSvg(EMPTY_VIEW, P, NOW)
+test('drawing: own ring, share line, sparkline', async () => {
+  const s = synced({ busy: true, updated: NOW - MIN })
+  const empty = gaugeSvg(EMPTY_VIEW, plan(EMPTY_VIEW, P, s, NOW), s, NOW)
   expect(empty).not.toContain('class="k ')
-  expect(empty).not.toContain('<polyline')
-  const v = summarize([{ t: NOW - 30 * MIN, tok: 1, out: 1, pct: 50 }], { pct: 70, resetsAt, week: 40 }, NOW)
-  const full = gaugeSvg(v, P, NOW)
+  expect(empty).toContain('● working')
+  const v = summarize([{ t: NOW - 30 * MIN, tok: 1, out: 1, pct: 50, usd: 40 }], { pct: 70, resetsAt, week: 40 }, NOW, null, 2)
+  const full = gaugeSvg(v, plan(v, P, s, NOW), s, NOW)
   expect(full).toContain('class="k error"')
-  expect(full).toContain('class="k wk"')
+  expect(full).toContain('>80%</text>')
   expect(full).toContain('<polyline')
-  expect(full).toContain('>0%</text>') // nothing left before stop
   expect(sparkline([[0, 0], [0.5, 50], [1, 100]], 4)).toBe('▁▄▄█')
 })

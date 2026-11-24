@@ -4,38 +4,60 @@ export type View = {
   resetsAt: string | null
   /** 7-day window % used, null before any reading. */
   week: number | null
-  /** % of the 5-hour window used in the last 15 minutes (whole account). */
-  pct15: number
   /** Tokens this PC used in the last 15 minutes / in the current 5-hour window. */
   tokens15: number
   out15: number
   tokensWindow: number
-  /** % of the 5-hour window this PC used, this window / last 30 minutes. */
+  /** % of the 5-hour window this PC used: this window / last 15 minutes. */
   mine: number
-  mine30: number
-  /** % the rest of the account (other PC, Chat, claude.ai) used in the last 30 minutes. */
-  other30: number
-  /** True once this PC has learned how much % a dollar of its usage is. */
+  mine15: number
+  /** True once a %-per-dollar rate is known (this PC's samples or the other PC's). */
   isCalibrated: boolean
-  /** The 5-hour % over the window: [0..1 through the window, %]. */
+  /** This PC's usage over the window: [0..1 through the window, %]. */
   points: [number, number][]
   /** This session's cost at API prices, USD. */
   cost: number | null
 }
 
 export type Prefs = {
-  /** Stop at this 5-hour %. */
-  limit: number
-  /** Split the limit with other use by recent work. */
-  split: boolean
+  /** This PC's share of the 5-hour window in %, used until the synced shares say otherwise. */
+  share: number
   /** Prompts go through until this time (ms). */
   snoozeUntil: number
   /** The next blocked prompt goes through once. */
   onePass: boolean
 }
 
+/** What one PC publishes to the shared gist. */
+export type PcStatus = {
+  /** When it last finished a turn (ms), 0 if never. */
+  t: number
+  /** Running a Claude turn right now. */
+  busy: boolean
+  /** When this status was written (ms). */
+  updated: number
+  /** % of the 5-hour window this PC used, for the window ending at resetsAt. */
+  mine: number
+  resetsAt: string | null
+  /** Its %-per-dollar samples, so a new PC is calibrated at once. */
+  samples: number[]
+}
+
+export type Sync = {
+  /** This PC's name in the gist. */
+  me: string | null
+  /** Why syncing is off, or null while it works. */
+  error: string | null
+  /** When the gist was last read (ms), 0 if never. */
+  at: number
+  /** Share in % per PC name. */
+  shares: Record<string, number>
+  /** Every PC's status, this one included. */
+  pcs: Record<string, PcStatus>
+}
+
 declare module 'claude-code' {
   interface PluginState {
-    'usage-guard': { view: View; prefs: Prefs }
+    'usage-guard': { view: View; prefs: Prefs; sync: Sync }
   }
 }

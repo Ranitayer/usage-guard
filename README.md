@@ -1,11 +1,21 @@
 # usage-guard
 
-A Claude Code plugin that shows your Claude usage in a band above the prompt and stops you at a limit you set.
+A Claude Code plugin that shows your Claude usage in a band above the prompt and splits your 5-hour limit between your PCs.
 
-- **Band:** 5-hour usage ring, weekly ring, how much is left before you're stopped (with a pace forecast), usage and tokens in the last 15 minutes, this PC's usage, session cost, and a graph of the 5-hour window.
-- **Limit:** `Limit − 70% +` on the band, or `/usage-limit 45` for any number. Prompts are blocked once you reach it; **Let 1 through** and **Snooze 15m** buttons appear when you're stopped.
-- **Two PCs:** the limit is shared automatically. If the other PC (or Chat / claude.ai) is idle, this PC can use the whole limit; if both are busy, it's split by who's doing more work (20/80 to 80/20). Set the same limit on both PCs. `/usage-split off` turns this off.
-- **Warning:** a pop-up at 80% of what this PC may use.
+- **Ring:** how much of the 5-hour window *this PC* used, filling toward what it may use. Small ring: the account's weekly usage.
+- **Left before stop:** what this PC can still use, with a forecast at its last 15 minutes' pace.
+- **Other PC:** whether your other PC is **● working** right now (running a Claude turn) or idle, and how much of its share it used.
+- **Account:** the whole account's 5-hour %, and this session's cost.
+- **Graph:** this PC's usage over the 5-hour window, with the line it stops at.
+- **This PC's share − 70% +:** this PC's part of the 5-hour window. Change it on either PC and the other gets the rest (70 here = 30 there). Also `/usage-share 70`; `/usage-share` alone shows where both PCs stand.
+
+**Rules**
+- Each PC stops at its own share. When stopped, **Let 1 through** and **Snooze 15m** appear.
+- If the other PC hasn't run a turn for 30 minutes, it lends its share: this PC may use everything the other one hasn't.
+- A pop-up warns at 80% of what this PC may use.
+- If GitHub can't be reached, the band says **not synced** and each PC simply keeps to its own share.
+
+**How the PCs talk:** through a secret GitHub Gist named "usage-guard sync" on your account, created automatically. Each PC writes one small file there (its usage, whether it's working, its share); no code, keys or messages. Secret gists are unlisted but readable by anyone who has the exact link. The plugin uses the token of the signed-in GitHub CLI (`gh`), only in memory.
 
 Only works in Claude Code (the Code tab of the desktop app, or the `claude` CLI), not the regular Chat tab.
 
@@ -13,35 +23,35 @@ Only works in Claude Code (the Code tab of the desktop app, or the `claude` CLI)
 
 You are installing this plugin on the user's computer. Do these steps in order, and tell the user what you did.
 
-1. **Clone the repository.** The plugin must end up at `<home>/.claude/plugin-src/usage-guard`, where `<home>` is the user's home folder (`%USERPROFILE%` on Windows, `~` on macOS/Linux). It must be a git clone: that is how it updates itself.
-   - It needs `git`. If `git --version` fails, tell the user to install Git (on Windows: Git for Windows, https://git-scm.com/download/win, or `winget install --id Git.Git -e`) and stop until they have.
-   - If that folder already exists and is not a git clone (for example an older copy from a zip), move it aside to `usage-guard.old` first.
+1. **Git and the GitHub CLI.** Check `git --version` and `gh --version`. If either is missing, install it (Windows: `winget install --id Git.Git -e` and `winget install --id GitHub.cli -e`; macOS: `brew install git gh`) or ask the user to, then open a new terminal so they're on PATH.
+
+2. **Sign in to GitHub.** Run `gh auth status`. If it is not signed in, the user must run `gh auth login` themselves (it opens a browser). Tell them to choose GitHub.com, HTTPS, and log in with a browser, using the same GitHub account as their other PC. The default scopes include `gist`, which the plugin needs. Wait until `gh auth status` shows them signed in.
+
+3. **Clone the repository.** The plugin must end up at `<home>/.claude/plugin-src/usage-guard`, where `<home>` is the user's home folder (`%USERPROFILE%` on Windows, `~` on macOS/Linux). It must be a git clone: that is how it updates itself. If that folder exists and is not a git clone (an older copy), move it aside to `usage-guard.old` first.
    - Windows PowerShell:
      ```powershell
      New-Item -ItemType Directory -Force "$env:USERPROFILE\.claude\plugin-src" | Out-Null
      git clone https://github.com/Ranitayer/usage-guard.git "$env:USERPROFILE\.claude\plugin-src\usage-guard"
      ```
    - macOS/Linux: `mkdir -p ~/.claude/plugin-src && git clone https://github.com/Ranitayer/usage-guard.git ~/.claude/plugin-src/usage-guard`
-   - Check that `<home>/.claude/plugin-src/usage-guard/.claude-plugin/plugin.json` exists.
+   - If it is already a clone, run `git -C <that folder> pull --ff-only` instead.
 
-2. **Register it in the user's settings.** Edit `<home>/.claude/settings.json` (create it as `{}` if missing). Read it first and keep every existing key. Add, inside the top-level `"env"` object (create `"env"` if missing):
+4. **Register it in the user's settings.** Edit `<home>/.claude/settings.json` (create it as `{}` if missing). Read it first and keep every existing key. Inside the top-level `"env"` object (create it if missing) add:
 
    ```json
    "CLAUDE_CODE_PLUGIN_DIRS": "~/.claude/plugin-src/usage-guard"
    ```
 
-   If `CLAUDE_CODE_PLUGIN_DIRS` already exists, append this folder to it instead of replacing it, separated by `;` on Windows or `:` on macOS/Linux. Make sure the file is still valid JSON afterwards.
+   If `CLAUDE_CODE_PLUGIN_DIRS` already lists this folder, leave it. If it lists others, append this one, separated by `;` on Windows or `:` on macOS/Linux. Make sure the file is still valid JSON.
 
-3. **Optional: hide the ponytail band.** Only if the user has the ponytail plugin and wants its band replaced by this one, write the text `off` to `<home>/.claude/.ponytail-band`.
+5. **Optional: hide the ponytail band.** Only if the user has the ponytail plugin and wants its band replaced, write the text `off` to `<home>/.claude/.ponytail-band`.
 
-4. **Check it (if the `claude` CLI is available):** `claude plugin list` should show `usage-guard@inline` with status loaded.
-
-5. **Tell the user to restart the Claude app completely** (on Windows also quit it from the system tray), then send one message in the Code tab. The band appears after Claude's first reply. Remind them to set the same limit on every PC.
+6. **Tell the user to restart the Claude app completely** (on Windows also quit it from the system tray), then send one message in the Code tab. The band appears after Claude's first reply; "Other PC" fills in within a minute once both PCs have run it.
 
 ## Updates
 
-Each time a Claude Code session starts, the plugin runs `git pull --ff-only` on its own folder, so pushes to this repository reach every PC the next time Claude opens there (a small "usage-guard updated" pop-up says so). Nothing to do by hand. If the folder has local edits that conflict, the pull is skipped; `git -C <home>/.claude/plugin-src/usage-guard status` shows why.
+Each time a Claude Code session starts, the plugin runs `git pull --ff-only` on its own folder, so pushes to this repository reach every PC the next time Claude opens there (a "usage-guard updated" pop-up says so). If the folder has conflicting local edits, the pull is skipped; `git -C <home>/.claude/plugin-src/usage-guard status` shows why.
 
 ## Uninstall
 
-Remove the `CLAUDE_CODE_PLUGIN_DIRS` entry for this folder from `<home>/.claude/settings.json`, delete `<home>/.claude/plugin-src/usage-guard`, and restart the app.
+Remove this folder from `CLAUDE_CODE_PLUGIN_DIRS` in `<home>/.claude/settings.json`, delete `<home>/.claude/plugin-src/usage-guard`, and restart the app. Delete the "usage-guard sync" gist at https://gist.github.com if you no longer want it.
