@@ -6,6 +6,9 @@ import type { PcStatus, Sync } from '../types'
 export const GIST_DESCRIPTION = 'usage-guard sync'
 const API = 'https://api.github.com'
 const TIMEOUT = 8_000
+// Some networks drop a share of connections to api.github.com: each call tries this many times, waiting this long each.
+const TRIES = 3
+const TRY_TIMEOUT = 4_000
 
 export const EMPTY_SYNC: Sync = { me: null, error: null, at: 0, shares: {}, pcs: {} }
 
@@ -75,7 +78,14 @@ async function auth($: EngineInterface, st: GistState): Promise<string> {
 
 async function call($: EngineInterface, st: GistState, path: string, method = 'GET', body?: unknown): Promise<unknown> {
   const token = await auth($, st)
-  const res = await Promise.race([
+  let res: Awaited<ReturnType<EngineInterface['http']['fetch']>> | null = null
+  for (let i = 0; i < TRIES && !res; i++) res = await attempt($, token, path, method, body).catch(() => null)
+  if (!res) throw new Error('GitHub not reachable')
+  return check($, st, path, res)
+}
+
+function attempt($: EngineInterface, token: string, path: string, method: string, body?: unknown) {
+  return Promise.race([
     $.http.fetch(`${API}${path}`, {
       method,
       headers: {
@@ -86,8 +96,11 @@ async function call($: EngineInterface, st: GistState, path: string, method = 'G
       },
       ...(body ? { body: JSON.stringify(body) } : {}),
     }),
-    new Promise<never>((_, reject) => $.clock.after(TIMEOUT, () => reject(new Error('GitHub not reachable')))),
+    new Promise<never>((_, reject) => $.clock.after(TRY_TIMEOUT, () => reject(new Error('GitHub not reachable')))),
   ])
+}
+
+async function check($: EngineInterface, st: GistState, path: string, res: Awaited<ReturnType<EngineInterface['http']['fetch']>>): Promise<unknown> {
   if (res.status === 401) {
     st.token = null
     throw new Error('run: gh auth login')

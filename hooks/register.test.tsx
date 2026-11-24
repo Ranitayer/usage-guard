@@ -16,7 +16,8 @@ type Files = Record<string, string>
  * Stands in for the engine and GitHub: an in-memory $.store, the clock, a 5-hour reading,
  * `hostname` and `gh auth token`, and a fake gist API holding `files`.
  */
-function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<string, unknown>; files?: Files; offline?: boolean }) {
+function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<string, unknown>; files?: Files; offline?: boolean; flaky?: boolean }) {
+  let calls = 0
   const store = new Map<string, unknown>(Object.entries(o.stored ?? {}))
   const files: Files = { ...(o.files ?? {}) }
   const hasGist = { v: o.files !== undefined }
@@ -37,6 +38,8 @@ function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<s
     return out('', 1)
   })
   on('http.fetch', (_, e) => {
+    // A flaky network: two of every three requests never connect.
+    if (o.flaky && ++calls % 3 !== 0) throw new Error('connect timeout')
     const reply = (body: unknown, status = 200) => ({ value: { status, ok: status < 400, headers: {}, text: JSON.stringify(body) } })
     const method = e.init?.method ?? 'GET'
     if (e.url.endsWith('/gists?per_page=100')) return reply(hasGist.v ? [{ id: 'g1', description: 'usage-guard sync', created_at: '2026-01-01' }] : [])
@@ -105,7 +108,7 @@ test('synced: the other PC working shows, shares add up to 100, the prompt goes 
 
   const desk = await $.ui.mount({ ...BAND, surface: 'desktop' })
   expect(JSON.stringify(await desk.find({ type: 'Svg' }))).toContain('This PC used 20% of the 5-hour window (may use 70%)')
-  expect((await desk.find({ type: 'Text', text: /other PC/ }))?.text).toBe('other PC 30%')
+  expect((await desk.find({ type: 'Text', text: /Limit/ }))?.text).toBe('Limit')
   await desk.unmount()
 })
 
@@ -144,7 +147,7 @@ test('the other PC idle for 40 minutes lends its share', async ($, on) => {
   // 40% used, over its 30% share, but the other PC is idle: it may go to 90%.
   expect((await $.prompt.submit(PROMPT)).drop).toBe(undefined)
   const term = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect((await term.find({ type: 'Text', text: /Other PC/ }))?.text).toContain('lending you its share')
+  expect((await term.find({ type: 'Text', text: /Other PC/ }))?.text).toContain('lending to you')
   await term.unmount()
 })
 
@@ -162,5 +165,13 @@ test('GitHub unavailable: "not synced", the local share still stops this PC', as
   const term = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await term.find({ type: 'Text', text: /Other PC/ }))?.text).toContain('not synced')
   expect((await term.find({ type: 'Text', text: /Other PC/ }))?.text).toContain('gh auth login')
+  await term.unmount()
+})
+
+test('a flaky network: each GitHub call is retried, and the other PC still shows', async ($, on) => {
+  engine(on, { pct: 10, flaky: true, stored: { prefs: { share: 70 } }, files: { 'shares.json': JSON.stringify({ shares: { PCA: 70, PCB: 30 } }), 'pc-PCB.json': otherPc({ busy: true }) } })
+  await startSynced($)
+  const term = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await term.find({ type: 'Text', text: /Other PC/ }))?.text).toContain('● working')
   await term.unmount()
 })

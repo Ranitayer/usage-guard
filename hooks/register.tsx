@@ -93,7 +93,7 @@ const live: { gist: GistState | null; busy: boolean; lastPull: number; lastBeat:
 /** Reads both PCs' state from the live.gist into the band; a failure only marks the band "not synced". */
 async function pull($: EngineInterface, force = false) {
   const now = await $.clock.now()
-  if (!live.gist || (!force && now - live.lastPull < PULL_EVERY)) return
+  if (!live.gist || (!force && now - live.lastPull < PULL_EVERY - 5_000)) return
   live.lastPull = now
   try {
     const remote = await readGist($, live.gist)
@@ -179,7 +179,8 @@ export const register: Register = on => {
     live.gist = { token: null, id: null }
     // Background sync never throws: a failure only shows as "not synced" on the band.
     void pull($, true).then(() => push($)).catch(() => undefined)
-    $.clock.every(PULL_EVERY, () => void pull($).catch(() => undefined))
+    // Every minute: read the other PC, and tell it this one is still online.
+    $.clock.every(PULL_EVERY, () => void pull($).then(() => push($)).catch(() => undefined))
 
     // Self-update from GitHub when installed as a git clone; the watched folder reloads what the pull changed.
     // Not awaited, so a slow network never holds up the session; no git or no clone just does nothing.
@@ -305,7 +306,6 @@ export const register: Register = on => {
     const f = figures(v, pl, s, now)
     const isSnoozed = now < p.snoozeUntil
     const isBlocked = blockReason(v, { ...p, snoozeUntil: 0 }, pl, now) !== null
-    const otherShare = pl.others[0]?.share ?? 100 - pl.share
 
     const controls = (
       <Box flexDirection="column" alignItems="flex-end" gap={1}>
@@ -335,13 +335,12 @@ export const register: Register = on => {
           </Box>
         )}
         <Box flexDirection="column" alignItems="center">
-          <Text dimColor>This PC's share</Text>
+          <Text dimColor>Limit</Text>
           <Box flexDirection="row" alignItems="center" gap={1}>
             <Button key="down" plain label="−" onPress={() => setShare($, pl.share - STEP)} />
             <Text bold>{pl.share}%</Text>
             <Button key="up" plain label="+" onPress={() => setShare($, pl.share + STEP)} />
           </Box>
-          <Text dimColor>other PC {otherShare}%</Text>
         </Box>
       </Box>
     )

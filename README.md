@@ -4,16 +4,16 @@ A Claude Code plugin that shows your Claude usage in a band above the prompt and
 
 - **Ring:** how much of the 5-hour window *this PC* used, filling toward what it may use. Small ring: the account's weekly usage.
 - **Left before stop:** what this PC can still use, with a forecast at its last 15 minutes' pace.
-- **Other PC:** whether your other PC is **● working** right now (running a Claude turn) or idle, and how much of its share it used.
+- **Other PC:** **● working** (running a Claude turn right now), **● online** (Claude open, idle), or **offline** (with when it was last seen), plus how much of its share it used.
 - **Account:** the whole account's 5-hour %, and this session's cost.
 - **Graph:** this PC's usage over the 5-hour window, with the line it stops at.
-- **This PC's share − 70% +:** this PC's part of the 5-hour window. Change it on either PC and the other gets the rest (70 here = 30 there). Also `/usage-share 70`; `/usage-share` alone shows where both PCs stand.
+- **Limit − 70% +:** this PC's part of the 5-hour window. Change it on either PC and the other gets the rest (70 here = 30 there). Also `/usage-share 70`; `/usage-share` alone shows where both PCs stand.
 
 **Rules**
 - Each PC stops at its own share. When stopped, **Let 1 through** and **Snooze 15m** appear.
 - If the other PC hasn't run a turn for 30 minutes, it lends its share: this PC may use everything the other one hasn't.
 - A pop-up warns at 80% of what this PC may use.
-- If GitHub can't be reached, the band says **not synced** and each PC simply keeps to its own share.
+- Each GitHub call is retried 3 times, and the other PC's last known state is kept for 10 minutes. Past that, the band says **not synced** and each PC simply keeps to its own limit.
 
 **How the PCs talk:** through a secret GitHub Gist named "usage-guard sync" on your account, created automatically. Each PC writes one small file there (its usage, whether it's working, its share); no code, keys or messages. Secret gists are unlisted but readable by anyone who has the exact link. The plugin uses the token of the signed-in GitHub CLI (`gh`), only in memory.
 

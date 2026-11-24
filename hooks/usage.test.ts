@@ -1,7 +1,7 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Sync } from '../types'
-import { DEFAULT_PREFS, EMPTY_VIEW, asPrefs, blockReason, gaugeSvg, level, pace, plan, prune, rateFrom, sampleOf, sparkline, summarize } from './usage'
+import { DEFAULT_PREFS, EMPTY_VIEW, asPrefs, blockReason, gaugeSvg, level, otherText, pace, plan, prune, rateFrom, sampleOf, sparkline, summarize } from './usage'
 import { parseGist, pcName, sharesFor } from './sync'
 
 const NOW = Date.parse('2026-11-24T12:00:00Z')
@@ -49,7 +49,7 @@ test('shares: 70 here means 30 there; this PC stops at its own share', async () 
   expect(pl.cap).toBe(70)
   expect(pl.left).toBe(40)
   expect(pl.isLending).toBe(false)
-  expect(pl.others[0]).toEqual({ name: 'B', share: 30, mine: 10, isWorking: false, idleMs: 5 * MIN })
+  expect(pl.others[0]).toEqual({ name: 'B', share: 30, mine: 10, isWorking: false, isOnline: true, seenMs: MIN, idleMs: 5 * MIN })
   // at its share: stopped, even though the account has room
   expect(blockReason({ ...v, mine: 70 }, P, plan({ ...v, mine: 70 }, P, s, NOW), NOW)).toContain('its 70% share')
   // the synced share wins over the local setting
@@ -73,9 +73,20 @@ test('working now, idle, lending', async () => {
   expect(plan(v, P, synced({ t: NOW - 10 * MIN }), NOW).isLending).toBe(false)
 })
 
+test('other PC: working, online, offline; one failed check keeps the last state', async () => {
+  const v = { ...EMPTY_VIEW, pct: 20, resetsAt, mine: 5 }
+  const say = (s: Sync) => otherText(plan(v, P, s, NOW), s, NOW)
+  expect(say(synced({ busy: true, updated: NOW - MIN })).value).toBe('● working')
+  expect(say(synced({ updated: NOW - 2 * MIN, t: NOW - 12 * MIN }))).toEqual({ value: '● online', sub: 'idle 12m · 0% of 30%' })
+  expect(say(synced({ updated: NOW - 90 * MIN, t: NOW - 95 * MIN }))).toEqual({ value: 'offline', sub: 'lending to you'.replace(/^/, 'idle 1h 35m · '), tone: 'warning' })
+  expect(say(synced({ updated: NOW - 20 * MIN, t: NOW - 20 * MIN })).sub).toBe('seen 20m ago · 0% of 30%')
+  // a failed check 1 min after a good read still shows the other PC
+  expect(say({ ...synced({ busy: true }), error: 'GitHub not reachable' }).value).toBe('● working')
+})
+
 test('not synced: local share, no lending', async () => {
   const v = { ...EMPTY_VIEW, pct: 50, resetsAt, mine: 20 }
-  const offline: Sync = { ...synced({ t: NOW - 3 * 60 * MIN }), error: 'GitHub did not answer' }
+  const offline: Sync = { ...synced({ t: NOW - 3 * 60 * MIN }), error: 'GitHub not reachable', at: 0 }
   const pl = plan(v, P, offline, NOW)
   expect(pl.synced).toBe(false)
   expect(pl.isLending).toBe(false)

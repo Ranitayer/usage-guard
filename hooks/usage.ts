@@ -17,6 +17,8 @@ export const IDLE_AFTER = 30 * 60_000
 export const BUSY_STALE = 5 * 60_000
 /** Synced data older than this is not trusted for lending. */
 export const SYNC_STALE = 10 * 60_000
+/** A PC that sent a status within this long has Claude open. */
+export const ONLINE_FOR = 5 * 60_000
 
 export const EMPTY_VIEW: View = {
   pct: null,
@@ -111,7 +113,7 @@ export function summarize(log: Entry[], reading: Reading | null, now: number, co
 }
 
 /** Another PC as this one sees it through the gist. */
-export type Other = { name: string; share: number; mine: number; isWorking: boolean; idleMs: number | null }
+export type Other = { name: string; share: number; mine: number; isWorking: boolean; isOnline: boolean; seenMs: number; idleMs: number | null }
 
 /** Every PC but this one; usage from a window that has since reset counts as 0. */
 export function othersOf(s: Sync, myShare: number, now: number): Other[] {
@@ -124,12 +126,16 @@ export function othersOf(s: Sync, myShare: number, now: number): Other[] {
       share: s.shares[name] ?? Math.round((100 - myShare) / names.length),
       mine: windowOver ? 0 : st.mine,
       isWorking: st.busy && now - st.updated < BUSY_STALE,
+      // Claude open there: it sends a status every minute.
+      isOnline: now - st.updated < ONLINE_FOR,
+      seenMs: now - st.updated,
       idleMs: st.t > 0 ? now - st.t : null,
     }
   })
 }
 
-export const isSynced = (s: Sync, now: number) => s.error === null && s.at > 0 && now - s.at < SYNC_STALE
+// A failed check does not drop the other PC at once: the last good read counts for SYNC_STALE.
+export const isSynced = (s: Sync, now: number) => s.at > 0 && now - s.at < SYNC_STALE
 
 export type Plan = {
   share: number
@@ -194,13 +200,15 @@ export const toneOf = (frac: number) => (frac >= 1 ? 'error' : frac >= 0.8 ? 'wa
 
 /** The other PC's state in a few words. */
 export function otherText(pl: Plan, s: Sync, now: number): { value: string; sub: string; tone?: 'success' | 'warning' } {
-  if (!pl.synced) return { value: 'not synced', sub: s.error ?? (s.at === 0 ? 'connecting…' : 'GitHub not reachable') }
+  if (!pl.synced) return { value: 'not synced', sub: s.at === 0 ? (s.error ?? 'connecting…') : 'GitHub not reachable' }
   const o = pl.others[0]
   if (!o) return { value: 'not seen yet', sub: 'install it on the other PC' }
   const usedText = `${o.mine}% of ${o.share}%`
+  const idle = o.idleMs === null ? 'idle' : `idle ${fmtDur(o.idleMs)}`
   if (o.isWorking) return { value: '● working', sub: usedText, tone: 'success' }
-  if (pl.isLending) return { value: o.idleMs === null ? 'idle' : `idle ${fmtDur(o.idleMs)}`, sub: 'lending you its share', tone: 'warning' }
-  return { value: o.idleMs === null ? 'idle' : `idle ${fmtDur(o.idleMs)}`, sub: usedText }
+  const value = o.isOnline ? '● online' : 'offline'
+  if (pl.isLending) return { value, sub: `${idle} · lending to you`, tone: 'warning' }
+  return { value, sub: o.isOnline ? `${idle} · ${usedText}` : `seen ${fmtDur(o.seenMs)} ago · ${usedText}` }
 }
 
 type Col = { label: string; value: string; sub: string; tone?: 'success' | 'warning' | 'error' }
