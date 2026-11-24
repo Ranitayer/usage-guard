@@ -1,14 +1,14 @@
 import { expect, test } from 'claude-code/testing'
 
 import type { Sync } from '../types'
-import { DEFAULT_PREFS, EMPTY_VIEW, asPrefs, blockReason, gaugeSvg, level, otherText, pace, plan, prune, rateFrom, sampleOf, sparkline, summarize } from './usage'
-import { parseGist, pcName, sharesFor } from './sync'
+import { DEFAULT_PREFS, EMPTY_VIEW, addToDays, asPrefs, dayKey, historyOf, historySvg, projectsOf, blockReason, gaugeSvg, level, otherText, pace, plan, prune, rateFrom, sampleOf, sparkline, summarize } from './usage'
+import { gitError, parseFiles, pcName, sharesFor, syncUrl } from './sync'
 
 const NOW = Date.parse('2026-11-24T12:00:00Z')
 const MIN = 60_000
 const resetsAt = new Date(NOW + 2 * 60 * MIN).toISOString() // window began 3h ago
 const P = { ...DEFAULT_PREFS, share: 70 }
-const status = (over: Partial<Sync['pcs'][string]> = {}) => ({ t: NOW - 60 * MIN, busy: false, updated: NOW - MIN, mine: 0, resetsAt, samples: [], ...over })
+const status = (over: Partial<Sync['pcs'][string]> = {}) => ({ t: NOW - 60 * MIN, busy: false, updated: NOW - MIN, mine: 0, resetsAt, samples: [], days: {}, ...over })
 const synced = (other: Partial<Sync['pcs'][string]>, shares = { A: 70, B: 30 }): Sync => ({
   me: 'A',
   error: null,
@@ -79,7 +79,8 @@ test('other PC: working, online, offline; one failed check keeps the last state'
   expect(say(synced({ busy: true, updated: NOW - MIN })).value).toBe('● working')
   expect(say(synced({ updated: NOW - 2 * MIN, t: NOW - 12 * MIN }))).toEqual({ value: '● online', sub: 'idle 12m · 0% of 30%' })
   expect(say(synced({ updated: NOW - 90 * MIN, t: NOW - 95 * MIN }))).toEqual({ value: 'offline', sub: 'lending to you'.replace(/^/, 'idle 1h 35m · '), tone: 'warning' })
-  expect(say(synced({ updated: NOW - 20 * MIN, t: NOW - 20 * MIN })).sub).toBe('seen 20m ago · 0% of 30%')
+  // offline: lends right away
+  expect(say(synced({ updated: NOW - 20 * MIN, t: NOW - 20 * MIN }))).toEqual({ value: 'offline', sub: 'idle 20m · lending to you', tone: 'warning' })
   // a failed check 1 min after a good read still shows the other PC
   expect(say({ ...synced({ busy: true }), error: 'GitHub not reachable' }).value).toBe('● working')
 })
@@ -115,17 +116,60 @@ test('rate: median of samples; whole-% readings need a 1% rise', async () => {
   expect(sampleOf(2, 1)).toBe(2)
 })
 
-test('gist files: bad content is ignored, names are made safe', async () => {
-  const g = parseGist({
-    'shares.json': { content: JSON.stringify({ shares: { A: 70, B: 30, C: 500 } }) },
-    'pc-A.json': { content: JSON.stringify({ t: 5, busy: true, updated: 6, mine: 12.5, resetsAt, samples: [2, -1, 'x'] }) },
-    'pc-B.json': { content: 'not json' },
-    'notes.txt': { content: 'hi' },
+test('sync files: bad content is ignored, names are made safe; repo address and errors', async () => {
+  const g = parseFiles({
+    'shares.json': JSON.stringify({ shares: { A: 70, B: 30, C: 500 } }),
+    'pc-A.json': JSON.stringify({ t: 5, busy: true, updated: 6, mine: 12.5, resetsAt, samples: [2, -1, 'x'], days: { '2026-11-24': 3, bad: 1 } }),
+    'pc-B.json': 'not json',
   })
   expect(g.shares).toEqual({ A: 70, B: 30 })
   expect(Object.keys(g.pcs)).toEqual(['A'])
   expect(g.pcs.A!.samples).toEqual([2])
+  expect(g.pcs.A!.days).toEqual({ '2026-11-24': 3 })
   expect(pcName(' DESKTOP 7/Q \n')).toBe('DESKTOP-7-Q')
+  expect(syncUrl('https://github.com/Ranitayer/usage-guard.git\n')).toBe('https://github.com/Ranitayer/usage-guard-sync.git')
+  expect(syncUrl('git@github.com:Ranitayer/usage-guard.git')).toBe('https://github.com/Ranitayer/usage-guard-sync.git')
+  expect(syncUrl('/some/folder')).toBe(null)
+  expect(gitError('fatal: could not read Username for https://github.com')).toBe('run: gh auth login')
+  expect(gitError('remote: Repository not found.')).toBe('no access to usage-guard-sync')
+  expect(gitError('fatal: unable to access: Connection timed out')).toBe('GitHub not reachable')
+})
+
+test('offline right away lends; online but idle lends only after 30 minutes', async () => {
+  const v = { ...EMPTY_VIEW, pct: 50, resetsAt, mine: 45 }
+  // Claude closed on the other PC 6 minutes ago, last turn 8 minutes ago: lend now.
+  expect(plan(v, P, synced({ updated: NOW - 6 * MIN, t: NOW - 8 * MIN }), NOW).isLending).toBe(true)
+  // Claude open there, idle 8 minutes: not yet.
+  expect(plan(v, P, synced({ updated: NOW - MIN, t: NOW - 8 * MIN }), NOW).isLending).toBe(false)
+})
+
+test('history: per project this window, per day per PC, per hour', async () => {
+  const log = [
+    { t: NOW - 60 * MIN, tok: 1, out: 1, pct: 10, usd: 2, proj: 'app' },
+    { t: NOW - 30 * MIN, tok: 1, out: 1, pct: 12, usd: 1, proj: 'site' },
+    { t: NOW - 10 * MIN, tok: 1, out: 1, pct: 14, usd: 2.5, proj: 'app' },
+    { t: NOW - 6 * 60 * MIN, tok: 1, out: 1, pct: 3, usd: 9, proj: 'old' },
+  ]
+  expect(projectsOf(log, { pct: 14, resetsAt }, NOW, 2)).toEqual([['app', 9], ['site', 2]])
+
+  let days = addToDays({}, NOW - 2 * 86_400_000, 4)
+  days = addToDays(days, NOW, 3)
+  days = addToDays(days, NOW, 2)
+  days = addToDays(days, NOW - 20 * 86_400_000, 50) // older than 14 days before the newest: dropped
+  expect(Object.keys(days).sort()).toEqual([dayKey(NOW - 2 * 86_400_000), dayKey(NOW)])
+  expect(days[dayKey(NOW)]!.pct).toBe(5)
+  expect(days[dayKey(NOW)]!.hours[new Date(NOW).getHours()]).toBe(5)
+
+  const s = synced({ days: { [dayKey(NOW)]: 7 } })
+  const h = historyOf(days, s, 'A', [['app', 9]], NOW)
+  expect(Object.keys(h.days)).toEqual(['A', 'B'])
+  expect(h.days.A![dayKey(NOW)]).toBe(5)
+  expect(h.days.B![dayKey(NOW)]).toBe(7)
+  expect(Object.keys(h.days.A!).length).toBe(14)
+  expect(h.hours.reduce((a, b) => a + b, 0)).toBe(9)
+  const svg = historySvg(h, 'A')
+  expect(svg).toContain('A (this PC)')
+  expect(svg).toContain('>app<')
 })
 
 test('stored prefs: the old limit carries over as the share', async () => {

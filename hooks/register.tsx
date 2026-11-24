@@ -1,11 +1,17 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Prefs, Sync, View } from '../types'
-import { EMPTY_SYNC, pcName, readGist, sharesFor, writeGist } from './sync'
-import type { GistState } from './sync'
+import type { History, Prefs, Sync, View } from '../types'
+import { EMPTY_SYNC, pcName, readSync, sharesFor, writeSync } from './sync'
+import type { SyncRepoState } from './sync'
 import {
   DEFAULT_PREFS,
+  addToDays,
+  asDays,
+  daysForStatus,
+  historyOf,
+  historySvg,
+  projectsOf,
   EMPTY_VIEW,
   SNOOZE,
   asEntries,
@@ -31,14 +37,19 @@ import {
 const STEP = 5
 // Until a rate is known: a response more than this after the last one is not counted to this PC.
 const GAP = 2 * 60_000
-// Read the gist at most this often unless something changed here.
+// Read the other PC's status at most this often unless something changed here.
 const PULL_EVERY = 30_000
+// While idle, say "online" this often (a PC counts as online for 5 minutes after its last status).
+const ONLINE_BEAT = 2 * 60_000
+const PANE = 'usage-history'
+const EMPTY_HISTORY: History = { projects: [], days: {}, hours: Array<number>(24).fill(0) }
 // While a turn runs, re-say "working" this often so a long turn never looks idle.
 const HEARTBEAT = 2 * 60_000
 
 const view = atom({ plugin: 'usage-guard', key: 'view' } as const, EMPTY_VIEW)
 const prefsAtom = atom({ plugin: 'usage-guard', key: 'prefs' } as const, DEFAULT_PREFS)
 const syncAtom = atom({ plugin: 'usage-guard', key: 'sync' } as const, EMPTY_SYNC)
+const historyAtom = atom({ plugin: 'usage-guard', key: 'history' } as const, EMPTY_HISTORY)
 
 // Values kept from an older version lack newer fields.
 const loadView = async ($: EngineInterface): Promise<View> => ({ ...EMPTY_VIEW, ...(await read($, view)) })
@@ -66,8 +77,13 @@ async function refresh($: EngineInterface): Promise<View> {
   if (five) await $.store.set('reading', { pct: five.percentUsed, resetsAt: five.resetsAt ?? null, week: week?.percentUsed ?? old?.week ?? null })
   const now = await $.clock.now()
   const s = await loadSync($)
-  const v = summarize(asEntries(await $.store.get('log')), asReading(await $.store.get('reading')), now, usage.cost?.usd ?? null, await rateOf($, s))
+  const log = asEntries(await $.store.get('log'))
+  const reading = asReading(await $.store.get('reading'))
+  const rate = await rateOf($, s)
+  const v = summarize(log, reading, now, usage.cost?.usd ?? null, rate)
   await update($, view, () => v)
+  const h = historyOf(asDays(await $.store.get('days')), s, s.me ?? 'this PC', projectsOf(log, reading, now, rate), now)
+  await update($, historyAtom, () => h)
 
   const pl = plan(v, asPrefs(await read($, prefsAtom)), s, now)
   const key = v.resetsAt ?? 'none'
@@ -82,23 +98,36 @@ async function refresh($: EngineInterface): Promise<View> {
 }
 
 // Sync state for this load of the module (a reload starts it over, which only costs one extra read).
-const live: { gist: GistState | null; busy: boolean; lastPull: number; lastBeat: number; queue: Promise<void> } = {
-  gist: null,
-  busy: false,
-  lastPull: 0,
-  lastBeat: 0,
-  queue: Promise.resolve(),
-}
+const live: {
+  repo: SyncRepoState | null
+  busy: boolean
+  pulling: Promise<void> | null
+  lastPull: number
+  lastBeat: number
+  lastPush: number
+  queue: Promise<void>
+} = { repo: null, busy: false, pulling: null, lastPull: 0, lastBeat: 0, lastPush: 0, queue: Promise.resolve() }
 
-/** Reads both PCs' state from the live.gist into the band; a failure only marks the band "not synced". */
+/** Reads both PCs' state from the sync repo into the band; a failure only marks the band "not synced". */
 async function pull($: EngineInterface, force = false) {
   const now = await $.clock.now()
-  if (!live.gist || (!force && now - live.lastPull < PULL_EVERY - 5_000)) return
+  if (!live.repo) return
+  // One read at a time: on a slow network a read can outlast the 30 s between them. A forced read waits for it.
+  if (live.pulling) return force ? live.pulling : undefined
+  if (!force && now - live.lastPull < PULL_EVERY - 5_000) return
   live.lastPull = now
+  live.pulling = pullNow($, now).finally(() => {
+    live.pulling = null
+  })
+  return live.pulling
+}
+
+async function pullNow($: EngineInterface, now: number) {
+  if (!live.repo) return
   try {
-    const remote = await readGist($, live.gist)
+    const remote = await readSync($, live.repo)
     const s = await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, ...remote, error: null, at: now }))
-    // A limit change not yet saved to the gist wins over what the gist says, and is sent again.
+    // A limit change not yet saved to the sync repo wins over what the gist says, and is sent again.
     const pending = await $.store.get('pendingShare')
     if (typeof pending === 'number') await pushShares($, pending)
     // First time this PC shows up: claim its share so the other PC's adds up to 100.
@@ -107,6 +136,12 @@ async function pull($: EngineInterface, force = false) {
     await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, error: err instanceof Error ? err.message : 'sync failed' }))
   }
   await refresh($).catch(() => undefined)
+}
+
+/** Every 30 s: read the other PC; every 2 min while idle, tell it this one is still online. */
+async function tick($: EngineInterface) {
+  await pull($)
+  if ((await $.clock.now()) - live.lastPush >= ONLINE_BEAT) await push($)
 }
 
 /** Publishes this PC's status, one write at a time so an older status never lands after a newer one. */
@@ -119,9 +154,10 @@ function push($: EngineInterface): Promise<void> {
 /** This PC's status: working or not, its own usage, its rate samples. */
 async function pushNow($: EngineInterface) {
   const s = await loadSync($)
-  if (!live.gist || !s.me) return
+  if (!live.repo || !s.me) return
   const v = await loadView($)
   const now = await $.clock.now()
+  live.lastPush = now
   const status = {
     t: Number((await $.store.get('lastTurn')) ?? 0),
     busy: live.busy,
@@ -129,9 +165,10 @@ async function pushNow($: EngineInterface) {
     mine: v.mine,
     resetsAt: v.resetsAt,
     samples: asSamples(await $.store.get('samples')).slice(-30),
+    days: daysForStatus(asDays(await $.store.get('days'))),
   }
   try {
-    await writeGist($, live.gist, { [`pc-${s.me}.json`]: status })
+    await writeSync($, live.repo, { [`pc-${s.me}.json`]: status })
     await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, pcs: { ...x.pcs, [s.me!]: status } }))
   } catch (err) {
     await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, error: err instanceof Error ? err.message : 'sync failed' }))
@@ -141,13 +178,13 @@ async function pushNow($: EngineInterface) {
 /** Sets this PC's share and gives the rest to the other PC(s), on both sides. */
 async function pushShares($: EngineInterface, share: number) {
   const s = await loadSync($)
-  if (!live.gist || !s.me) return
+  if (!live.repo || !s.me) return
   const shares = sharesFor(s.me, share, Object.keys(s.pcs).filter(n => n !== s.me))
   await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, shares }))
   // Kept until GitHub has it, so a dropped request is retried on the next sync instead of lost.
   await $.store.set('pendingShare', share)
   try {
-    await writeGist($, live.gist, { 'shares.json': { shares } })
+    await writeSync($, live.repo, { 'shares.json': { shares } })
     await $.store.delete('pendingShare')
   } catch {
     // Left pending: the next pull sends it again.
@@ -169,9 +206,14 @@ export const register: Register = on => {
   // Session cost at the last main-turn end, and the reading + cost after this turn's first response.
   let costAtLastTurn = 0
   let firstOfTurn: { pct: number; usd: number } | null = null
+  // The project this session works in, for "which project used it".
+  let project = 'other'
 
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'usage-share', description: "Set this PC's share of the 5-hour window in % (e.g. /usage-share 70)" })
+    await $.command.register({ name: 'usage-history', description: 'Show usage per day, per PC, per hour and per project' })
+    const root = (await $.session.repo().catch(() => null))?.root ?? (await $.session.cwd())
+    project = root.split(/[\\/]/).filter(Boolean).pop() ?? 'other'
     const p = asPrefs(await $.store.get('prefs'))
     await update($, prefsAtom, () => p)
     // A resumed session's cost so far was spent before this run.
@@ -186,11 +228,10 @@ export const register: Register = on => {
       await $.store.set('pcName', me)
     }
     await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, me: me as string }))
-    live.gist = { token: null, id: null }
+    live.repo = { dir: null }
     // Background sync never throws: a failure only shows as "not synced" on the band.
     void pull($, true).then(() => push($)).catch(() => undefined)
-    // Every minute: read the other PC, and tell it this one is still online.
-    $.clock.every(PULL_EVERY, () => void pull($).then(() => push($)).catch(() => undefined))
+    $.clock.every(PULL_EVERY, () => void tick($).catch(() => undefined))
 
     // Self-update from GitHub when installed as a git clone; the watched folder reloads what the pull changed.
     // Not awaited, so a slow network never holds up the session; no git or no clone just does nothing.
@@ -288,7 +329,13 @@ export const register: Register = on => {
       const tok = u ? u.input_tokens + u.output_tokens + u.cache_read_input_tokens + u.cache_creation_input_tokens : 0
       // shortcut: two sessions finishing at the same instant can drop one entry; fine for a usage meter.
       const log = prune(asEntries(await $.store.get('log')), now)
-      await $.store.set('log', [...log, { t: now, tok, out: u?.output_tokens ?? 0, pct: five?.percentUsed ?? null, d, usd }])
+      await $.store.set('log', [...log, { t: now, tok, out: u?.output_tokens ?? 0, pct: five?.percentUsed ?? null, d, usd, proj: project }])
+    }
+    if (isMain) {
+      // This turn's own % into the per-day and per-hour history.
+      const rate = await rateOf($, await loadSync($))
+      const own = rate !== null ? usd * rate : d
+      if (own > 0) await $.store.set('days', addToDays(asDays(await $.store.get('days')), now, own))
     }
     await refresh($).catch(() => undefined)
     if (isMain) {
@@ -302,6 +349,41 @@ export const register: Register = on => {
   on('session.measure', async ($, e, next) => {
     await refresh($).catch(() => undefined)
     return next(e)
+  })
+
+  on('command.run', { command: 'usage-history' }, async $ => {
+    await refresh($).catch(() => undefined)
+    await $.ui.open({ id: PANE, title: 'Usage history' })
+    return { text: 'Usage history opened.', isTextDisplayOnly: true }
+  })
+
+  // The history pane: projects this window, per-day usage of each PC, this PC by hour.
+  on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
+    // Not `h`: that name is the JSX factory.
+    const hist: History = { ...EMPTY_HISTORY, ...(await read($, historyAtom)) }
+    const me = (await loadSync($)).me ?? 'this PC'
+    const { Box, Text } = $.ui.resolve(e)
+    if (e.surface === 'terminal') {
+      const days = Object.keys(hist.days[me] ?? {})
+      return (
+        <Box flexDirection="column" gap={1}>
+          <Text bold>This 5-hour window by project</Text>
+          {hist.projects.length === 0 ? <Text dimColor>No usage yet this window</Text> : hist.projects.slice(0, 6).map(([p, n]) => <Text key={p}>{`${n}%`.padStart(6)}  {p}</Text>)}
+          <Text bold>Last {days.length} days</Text>
+          {Object.entries(hist.days).map(([pc, d]) => (
+            <Text key={pc}>
+              {sparkline(days.map((k, i) => [i / Math.max(1, days.length - 1), d[k] ?? 0] as [number, number]), days.length)} {pc === me ? `${pc} (this PC)` : pc}
+            </Text>
+          ))}
+          <Text bold>This PC by hour of day</Text>
+          <Text>{sparkline(hist.hours.map((v, i) => [i / 23, v] as [number, number]), 24)}</Text>
+          <Text dimColor>0h{' '.repeat(18)}23h</Text>
+        </Box>
+      )
+    }
+    const { Svg } = $.ui.resolve(e)
+    const alt = `Usage history. This window by project: ${hist.projects.map(([p, n]) => `${p} ${n}%`).join(', ') || 'none'}.`
+    return <Svg source={historySvg(hist, me)} alt={alt} />
   })
 
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
@@ -351,6 +433,7 @@ export const register: Register = on => {
             <Text bold>{pl.share}%</Text>
             <Button key="up" plain label="+" onPress={() => setShare($, pl.share + STEP)} />
           </Box>
+          <Button key="history" plain dimColor label="History" onPress={() => $.ui.open({ id: PANE, title: 'Usage history' })} />
         </Box>
       </Box>
     )

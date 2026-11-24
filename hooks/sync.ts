@@ -2,17 +2,19 @@ import type { EngineInterface } from 'claude-code'
 
 import type { PcStatus, Sync } from '../types'
 
-/** The gist both PCs share is found by this description. */
-export const GIST_DESCRIPTION = 'usage-guard sync'
-const API = 'https://api.github.com'
-const TIMEOUT = 8_000
-// Some networks drop a share of connections to api.github.com: each call tries this many times, waiting this long each.
+/** The private repo both PCs share sits next to this plugin's own repo: <owner>/usage-guard-sync. */
+export const SYNC_REPO = 'usage-guard-sync'
+// Some networks drop a share of connections to GitHub: each network call tries this many times, this long each.
 const TRIES = 3
-const TRY_TIMEOUT = 4_000
+const TRY_TIMEOUT = 20_000
+// Never ask on a terminal or in a window: a PC without a sign-in just reads "not synced".
+const GIT_ENV = { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }
+// Only the GitHub CLI's sign-in, whatever other credential helpers the PC has.
+const CRED = ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential']
 
 export const EMPTY_SYNC: Sync = { me: null, error: null, at: 0, shares: {}, pcs: {} }
 
-/** A PC name safe in a gist file name. */
+/** A PC name safe in a file name. */
 export const pcName = (raw: string) => raw.trim().replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 40) || 'pc'
 
 const asNumber = (v: unknown, d = 0) => (typeof v === 'number' && Number.isFinite(v) ? v : d)
@@ -21,6 +23,8 @@ const asNumber = (v: unknown, d = 0) => (typeof v === 'number' && Number.isFinit
 export function asStatus(text: string | undefined): PcStatus | null {
   try {
     const v = JSON.parse(text ?? '') as Partial<PcStatus>
+    const days: Record<string, number> = {}
+    for (const [d, n] of Object.entries(v.days ?? {})) if (/^\d{4}-\d{2}-\d{2}$/.test(d) && typeof n === 'number' && n >= 0) days[d] = n
     return {
       t: asNumber(v.t),
       busy: v.busy === true,
@@ -28,6 +32,7 @@ export function asStatus(text: string | undefined): PcStatus | null {
       mine: Math.max(0, asNumber(v.mine)),
       resetsAt: typeof v.resetsAt === 'string' ? v.resetsAt : null,
       samples: Array.isArray(v.samples) ? v.samples.filter((x): x is number => typeof x === 'number' && x > 0 && Number.isFinite(x)).slice(-30) : [],
+      days,
     }
   } catch {
     return null
@@ -46,15 +51,15 @@ export function asShares(text: string | undefined): Record<string, number> {
   }
 }
 
-/** The gist's files as the API gives them, into shares and statuses. */
-export function parseGist(files: Record<string, { content?: string } | null>): Pick<Sync, 'shares' | 'pcs'> {
+/** The sync repo's files (name → text) into shares and statuses. */
+export function parseFiles(files: Record<string, string>): Pick<Sync, 'shares' | 'pcs'> {
   const pcs: Record<string, PcStatus> = {}
-  for (const [file, f] of Object.entries(files)) {
+  for (const [file, text] of Object.entries(files)) {
     const m = /^pc-(.+)\.json$/.exec(file)
-    const s = m && f ? asStatus(f.content) : null
+    const s = m ? asStatus(text) : null
     if (m && s) pcs[m[1]!] = s
   }
-  return { shares: asShares(files['shares.json']?.content), pcs }
+  return { shares: asShares(files['shares.json']), pcs }
 }
 
 /** Shares after this PC picks `share`: the rest is split evenly over the other PCs. */
@@ -64,86 +69,93 @@ export function sharesFor(me: string, share: number, others: string[]): Record<s
   return out
 }
 
-/** What the gist calls remember between calls: the CLI's token (memory only, never stored) and the gist id. */
-export type GistState = { token: string | null; id: string | null }
-
-async function auth($: EngineInterface, st: GistState): Promise<string> {
-  if (st.token) return st.token
-  const r = await $.process.run(['gh', 'auth', 'token'], { timeoutMs: TIMEOUT }).catch(() => null)
-  if (!r) throw new Error('install GitHub CLI (gh)')
-  if (r.exitCode !== 0 || r.stdout.trim() === '') throw new Error('run: gh auth login')
-  st.token = r.stdout.trim()
-  return st.token
+/** The sync repo's address from this plugin's own clone: https://github.com/<owner>/usage-guard(.git) → <owner>/usage-guard-sync. */
+export function syncUrl(origin: string): string | null {
+  const m = /github\.com[/:]([^/]+)\/[^/\s]+?(\.git)?\s*$/.exec(origin.trim())
+  return m ? `https://github.com/${m[1]}/${SYNC_REPO}.git` : null
 }
 
-async function call($: EngineInterface, st: GistState, path: string, method = 'GET', body?: unknown): Promise<unknown> {
-  const token = await auth($, st)
-  let res: Awaited<ReturnType<EngineInterface['http']['fetch']>> | null = null
-  for (let i = 0; i < TRIES && !res; i++) res = await attempt($, token, path, method, body).catch(() => null)
-  if (!res) throw new Error('GitHub not reachable')
-  return check($, st, path, res)
+/** Why git failed, in a few words for the band. */
+export function gitError(stderr: string): string {
+  if (/could not read Username|Authentication failed|terminal prompts disabled|gh auth login|not logged/i.test(stderr)) return 'run: gh auth login'
+  if (/Repository not found|not found/i.test(stderr)) return `no access to ${SYNC_REPO}`
+  if (/gh: (command )?not found|'gh' is not recognized|executable file not found/i.test(stderr)) return 'install GitHub CLI (gh)'
+  return 'GitHub not reachable'
 }
 
-function attempt($: EngineInterface, token: string, path: string, method: string, body?: unknown) {
-  return Promise.race([
-    $.http.fetch(`${API}${path}`, {
-      method,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: 'application/vnd.github+json',
-        'User-Agent': 'usage-guard',
-        ...(body ? { 'Content-Type': 'application/json' } : {}),
-      },
-      ...(body ? { body: JSON.stringify(body) } : {}),
-    }),
-    new Promise<never>((_, reject) => $.clock.after(TRY_TIMEOUT, () => reject(new Error('GitHub not reachable')))),
-  ])
-}
+/** Where the local copy of the sync repo lives (the plugin's data folder, outside the watched plugin folder). */
+export type SyncRepoState = { dir: string | null }
 
-async function check($: EngineInterface, st: GistState, path: string, res: Awaited<ReturnType<EngineInterface['http']['fetch']>>): Promise<unknown> {
-  if (res.status === 401) {
-    st.token = null
-    throw new Error('run: gh auth login')
+async function git($: EngineInterface, args: string[], network = false): Promise<string> {
+  let err = ''
+  for (let i = 0; i < (network ? TRIES : 1); i++) {
+    const r = await $.process.run(['git', ...CRED, ...args], { env: GIT_ENV, timeoutMs: TRY_TIMEOUT }).catch((e: unknown) => {
+      err = e instanceof Error ? e.message : String(e)
+      return null
+    })
+    if (r?.exitCode === 0) return r.stdout
+    if (r) err = r.stderr
+    // A sign-in or access problem will not pass on a retry.
+    if (gitError(err) !== 'GitHub not reachable') break
   }
-  if (res.status === 404 && path.startsWith('/gists/')) {
-    // The gist was deleted: find or make one again next time.
-    st.id = null
-    await $.store.delete('gistId')
+  throw new Error(gitError(err))
+}
+
+/** The local clone, made on first use: a shallow copy, its commits signed "usage-guard". */
+async function repo($: EngineInterface, st: SyncRepoState): Promise<string> {
+  if (st.dir) return st.dir
+  const origin = await $.process.run(['git', '-C', $.plugin.root, 'remote', 'get-url', 'origin']).catch(() => null)
+  const url = origin?.exitCode === 0 ? syncUrl(origin.stdout) : null
+  if (!url) throw new Error('reinstall with git clone (see README)')
+  const data = (await $.process.hookEnv()).CLAUDE_PLUGIN_DATA
+  if (!data) throw new Error('no plugin data folder')
+  const dir = `${data}/sync`
+  const isClone = await $.process.run(['git', '-C', dir, 'rev-parse', '--is-inside-work-tree']).then(r => r.exitCode === 0).catch(() => false)
+  if (!isClone) {
+    await git($, ['clone', '-q', '--depth', '1', url, dir], true)
+    await git($, ['-C', dir, 'config', 'user.name', 'usage-guard'])
+    await git($, ['-C', dir, 'config', 'user.email', 'usage-guard@localhost'])
   }
-  if (!res.ok) throw new Error(`GitHub answered ${res.status}`)
-  return JSON.parse(res.text)
+  return (st.dir = dir)
 }
 
-/** The shared gist's id: remembered, found by description, or created (secret). */
-async function gistId($: EngineInterface, st: GistState): Promise<string> {
-  if (st.id) return st.id
-  const stored = await $.store.get('gistId')
-  if (typeof stored === 'string') return (st.id = stored)
-  const list = (await call($, st, '/gists?per_page=100')) as { id: string; description: string | null; created_at: string }[]
-  // The oldest one wins, so two PCs that created one at the same moment settle on the same gist.
-  const found = list.filter(g => g.description === GIST_DESCRIPTION).sort((a, b) => a.created_at.localeCompare(b.created_at))[0]
-  const id =
-    found?.id ??
-    ((await call($, st, '/gists', 'POST', {
-      description: GIST_DESCRIPTION,
-      public: false,
-      files: { 'shares.json': { content: JSON.stringify({ shares: {} }) } },
-    })) as { id: string }).id
-  await $.store.set('gistId', id)
-  return (st.id = id)
+/** Brings the local copy to GitHub's latest, throwing away anything local (only this plugin writes there). */
+async function latest($: EngineInterface, dir: string) {
+  await git($, ['-C', dir, 'fetch', '-q', '--depth', '1', 'origin', 'main'], true)
+  await git($, ['-C', dir, 'reset', '-q', '--hard', 'origin/main'])
 }
 
-/** Every PC's status and the shares, from the gist. */
-export async function readGist($: EngineInterface, st: GistState): Promise<Pick<Sync, 'shares' | 'pcs'>> {
-  const id = await gistId($, st)
-  const g = (await call($, st, `/gists/${id}`)) as { files: Record<string, { content?: string } | null> }
-  return parseGist(g.files)
+/** Every PC's status and the shares, from GitHub's latest. */
+export async function readSync($: EngineInterface, st: SyncRepoState): Promise<Pick<Sync, 'shares' | 'pcs'>> {
+  const dir = await repo($, st)
+  await latest($, dir)
+  const files: Record<string, string> = {}
+  for (const f of await $.fs.list(dir)) {
+    if (f.kind === 'file' && /^(pc-.+|shares)\.json$/.test(f.name)) files[f.name] = await $.fs.read(`${dir}/${f.name}`).catch(() => '')
+  }
+  return parseFiles(files)
 }
 
-/** Writes only the files given; the other PC's files are left alone. */
-export async function writeGist($: EngineInterface, st: GistState, files: Record<string, unknown>): Promise<void> {
-  const id = await gistId($, st)
-  const body: Record<string, { content: string }> = {}
-  for (const [name, v] of Object.entries(files)) body[name] = { content: JSON.stringify(v) }
-  await call($, st, `/gists/${id}`, 'PATCH', { files: body })
+/**
+ * Writes the given files and pushes them. Each try starts from GitHub's latest, so the other PC's
+ * newer files are kept and the push never conflicts; a push the other PC beat is simply tried again.
+ */
+export async function writeSync($: EngineInterface, st: SyncRepoState, files: Record<string, unknown>): Promise<void> {
+  const dir = await repo($, st)
+  let err: unknown = null
+  for (let i = 0; i < TRIES; i++) {
+    try {
+      await latest($, dir)
+      for (const [name, v] of Object.entries(files)) await $.fs.write(`${dir}/${name}`, JSON.stringify(v))
+      await git($, ['-C', dir, 'add', '-A'])
+      const changed = await $.process.run(['git', '-C', dir, 'diff', '--cached', '--quiet']).then(r => r.exitCode !== 0)
+      if (!changed) return
+      await git($, ['-C', dir, 'commit', '-q', '-m', Object.keys(files).join(' ')])
+      await git($, ['-C', dir, 'push', '-q', 'origin', 'HEAD:main'], true)
+      return
+    } catch (e) {
+      err = e
+    }
+  }
+  throw err instanceof Error ? err : new Error('GitHub not reachable')
 }

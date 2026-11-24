@@ -41,6 +41,18 @@ export type PcStatus = {
   resetsAt: string | null
   /** Its %-per-dollar samples, so a new PC is calibrated at once. */
   samples: number[]
+  /** Its own % of the 5-hour window used per local day (YYYY-MM-DD), the last 14 days. */
+  days: Record<string, number>
+}
+
+/** What the history pane shows. */
+export type History = {
+  /** This PC's % in the current 5-hour window per project, largest first. */
+  projects: [string, number][]
+  /** % per day for each PC (this one included), the last 14 days. */
+  days: Record<string, Record<string, number>>
+  /** This PC's % by hour of day (0..23) over the last 14 days. */
+  hours: number[]
 }
 
 export type Sync = {
@@ -58,6 +70,6 @@ export type Sync = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'usage-guard': { view: View; prefs: Prefs; sync: Sync }
+    'usage-guard': { view: View; prefs: Prefs; sync: Sync; history: History }
   }
 }

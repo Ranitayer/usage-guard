@@ -14,50 +14,55 @@ type Files = Record<string, string>
 
 /**
  * Stands in for the engine and GitHub: an in-memory $.store, the clock, a 5-hour reading,
- * `hostname` and `gh auth token`, and a fake gist API holding `files`.
+ * `hostname`, and a fake git: `files` is the sync repo on GitHub, `local` this PC's clone of it.
  */
 function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<string, unknown>; files?: Files; offline?: boolean; flaky?: boolean }) {
+  const store = new Map<string, unknown>(Object.entries(o.stored ?? {}))
+  const files: Files = { 'README.md': '# sync', ...(o.files ?? {}) }
+  let local: Files | null = null
   let calls = 0
   const net = { writesDown: false }
-  const store = new Map<string, unknown>(Object.entries(o.stored ?? {}))
-  const files: Files = { ...(o.files ?? {}) }
-  const hasGist = { v: o.files !== undefined }
   const resetsAt = new Date(Date.now() + 3600_000).toISOString()
+  const base = (path: string) => path.split('/').pop()!
   on('store.get', (_, e) => ({ value: store.get(e.key) }))
   on('store.set', (_, e) => (store.set(e.key, e.value), { value: undefined }))
   on('store.delete', (_, e) => (store.delete(e.key), { value: undefined }))
   on('clock.now', () => ({ value: Date.now() }))
   on('clock.every', () => ({ value: undefined }))
-  // Never fires: GitHub's timeout race is won by the fetch.
-  on('clock.after', () => new Promise<never>(() => {}))
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('ui.toast', () => ({ value: undefined }))
-  on('process.run', (_, e) => {
-    const out = (stdout: string, exitCode = 0) => ({ value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
-    if (e.argv[0] === 'hostname') return out('PCA\n')
-    if (e.argv[0] === 'gh') return o.offline ? out('', 1) : out('test-token\n')
-    return out('', 1)
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_DATA: '/data' } }))
+  on('fs.list', () => ({ value: Object.keys(local ?? {}).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })) }))
+  on('fs.read', (_, e) => ({ value: (local ?? {})[base(e.path)] ?? '' }))
+  on('fs.write', (_, e) => {
+    if (local) local[base(e.path)] = e.text
+    return { value: undefined }
   })
-  on('http.fetch', (_, e) => {
-    // A flaky network: two of every three requests never connect.
-    if (o.flaky && ++calls % 3 !== 0) throw new Error('connect timeout')
-    const reply = (body: unknown, status = 200) => ({ value: { status, ok: status < 400, headers: {}, text: JSON.stringify(body) } })
-    const method = e.init?.method ?? 'GET'
-    if (e.url.endsWith('/gists?per_page=100')) return reply(hasGist.v ? [{ id: 'g1', description: 'usage-guard sync', created_at: '2026-01-01' }] : [])
-    if (e.url.endsWith('/gists') && method === 'POST') {
-      hasGist.v = true
-      const body = JSON.parse(String(e.init?.body)) as { files: Record<string, { content: string }> }
-      for (const [n, f] of Object.entries(body.files)) files[n] = f.content
-      return reply({ id: 'g1' }, 201)
+  on('process.run', (_, e) => {
+    const out = (stdout: string, exitCode = 0, stderr = '') => ({ value: { exitCode, stdout, stderr, isStdoutTruncated: false, isStderrTruncated: false } })
+    const down = () => out('', 128, 'fatal: unable to access: Connection timed out')
+    const argv = e.argv.filter(a => !a.startsWith('credential.helper') && a !== '-c')
+    if (argv[0] === 'hostname') return out('PCA\n')
+    if (argv[0] !== 'git') return out('', 1)
+    const args = argv[1] === '-C' ? argv.slice(3) : argv.slice(1)
+    const cmd = args.join(' ')
+    const isNetwork = /^(clone|fetch|push)/.test(cmd)
+    // A flaky network: two of every three network calls never connect.
+    if (isNetwork && (o.offline || (o.flaky && ++calls % 3 !== 0))) return o.offline ? out('', 128, 'fatal: could not read Username for https://github.com') : down()
+    if (cmd === 'remote get-url origin') return out('https://github.com/Ranitayer/usage-guard.git\n')
+    if (cmd === 'pull --ff-only') return out('Already up to date.')
+    if (cmd.startsWith('rev-parse')) return local ? out('true') : out('', 128)
+    if (cmd.startsWith('clone')) return (local = { ...files }), out('')
+    if (cmd.startsWith('config') || cmd.startsWith('add') || cmd.startsWith('commit') || cmd.startsWith('fetch')) return out('')
+    if (cmd.startsWith('reset')) return (local = { ...files }), out('')
+    if (cmd.startsWith('diff')) return out('', JSON.stringify(local) === JSON.stringify(files) ? 0 : 1)
+    if (cmd.startsWith('push')) {
+      if (net.writesDown) return down()
+      Object.assign(files, local)
+      return out('')
     }
-    if (e.url.endsWith('/gists/g1') && method === 'PATCH') {
-      if (net.writesDown) throw new Error('connect timeout')
-      const body = JSON.parse(String(e.init?.body)) as { files: Record<string, { content: string }> }
-      for (const [n, f] of Object.entries(body.files)) files[n] = f.content
-      return reply({ id: 'g1' })
-    }
-    if (e.url.endsWith('/gists/g1')) return reply({ files: Object.fromEntries(Object.entries(files).map(([n, c]) => [n, { content: c }])) })
-    return reply({}, 404)
+    return out('', 1)
   })
   on('session.usage', () => ({
     value: {
@@ -70,6 +75,8 @@ function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<s
       cost: { usd: 1.5 },
     },
   }))
+  on('session.repo', () => ({ value: { root: '/home/me/code/my-app', remote: null, internal: false, name: 'my-app' } }))
+  on('session.cwd', () => ({ value: '/home/me/code/my-app' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('prompt.submit', (_, e) => ({ text: e.text }))
   return { store, files, net }
@@ -153,7 +160,7 @@ test('the other PC idle for 40 minutes lends its share', async ($, on) => {
   await term.unmount()
 })
 
-test("first sync creates the gist and claims this PC's share", async ($, on) => {
+test("first sync claims this PC's share in the sync repo", async ($, on) => {
   const g = engine(on, { pct: 5, stored: { prefs: { share: 60 } } })
   await startSynced($)
   expect(JSON.parse(g.files['shares.json']!).shares).toEqual({ PCA: 60 })
@@ -170,10 +177,12 @@ test('GitHub unavailable: "not synced", the local share still stops this PC', as
   await term.unmount()
 })
 
-test('a flaky network: each GitHub call is retried, and the other PC still shows', async ($, on) => {
+test('a flaky network: git calls are retried, and the next sync recovers what one missed', async ($, on) => {
   engine(on, { pct: 10, flaky: true, stored: { prefs: { share: 70 } }, files: { 'shares.json': JSON.stringify({ shares: { PCA: 70, PCB: 30 } }), 'pc-PCB.json': otherPc({ busy: true }) } })
   await startSynced($)
+  const said = await syncNow($)
   const term = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(said.text).toContain('PCB')
   expect((await term.find({ type: 'Text', text: /Other PC/ }))?.text).toContain('● working')
   await term.unmount()
 })
@@ -194,4 +203,26 @@ test('a limit change GitHub missed is sent again on the next sync', async ($, on
   await syncNow($)
   expect(JSON.parse(g.files['shares.json']!).shares).toEqual({ PCA: 80, PCB: 20 })
   expect(g.store.get('pendingShare')).toBe(undefined)
+})
+
+test('the History pane shows projects, both PCs per day, and hours', async ($, on) => {
+  const today = new Date()
+  const key = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`
+  const hours = Array<number>(24).fill(0)
+  hours[today.getHours()] = 6
+  engine(on, {
+    pct: 20,
+    stored: { prefs: { share: 70 }, samples: [2], days: { [key]: { pct: 6, hours } }, log: [{ t: Date.now() - 10 * MIN, tok: 1, out: 1, pct: 20, usd: 3, proj: 'my-app' }] },
+    files: { 'shares.json': JSON.stringify({ shares: { PCA: 70, PCB: 30 } }), 'pc-PCB.json': otherPc({ days: { [key]: 4 } }) },
+  })
+  await startSynced($)
+  await $.command.run({ command: 'usage-history', args: '', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } })
+  const pane = { plugin: 'usage-guard', component: 'Pane', requestId: 'usage-history', props: { title: 'Usage history', isFocused: false, bodyColumns: 60, placement: 'dock', scroll: { offset: 0, bodyRows: 30 }, view: {} } } as const
+  const desk = await $.ui.mount({ ...pane, surface: 'desktop' })
+  expect(JSON.stringify(await desk.find({ type: 'Svg' }))).toContain('my-app 6%')
+  await desk.unmount()
+  const term = await $.ui.mount({ ...pane, surface: 'terminal' })
+  expect((await term.find({ type: 'Text', text: /my-app/ }))?.text).toContain('6%')
+  expect((await term.find({ type: 'Text', text: /PCB/ }))?.text).toBeDefined()
+  await term.unmount()
 })

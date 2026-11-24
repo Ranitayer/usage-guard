@@ -1,10 +1,10 @@
-import type { PcStatus, Prefs, Sync, View } from '../types'
+import type { History, PcStatus, Prefs, Sync, View } from '../types'
 
 /**
  * One finished turn on this PC: when, its tokens, the 5-hour % right after it,
  * what it cost (usd, main turns only), and the % rise seen during it (d, used until a rate is known).
  */
-export type Entry = { t: number; tok: number; out: number; pct: number | null; d?: number; usd?: number }
+export type Entry = { t: number; tok: number; out: number; pct: number | null; d?: number; usd?: number; proj?: string }
 /** The last readings the API gave. */
 export type Reading = { pct: number; resetsAt: string | null; week?: number | null }
 
@@ -152,8 +152,8 @@ export function plan(v: View, p: Prefs, s: Sync, now: number): Plan {
   const synced = isSynced(s, now)
   const share = (synced && s.me !== null ? s.shares[s.me] : undefined) ?? p.share
   const others = synced ? othersOf(s, share, now) : []
-  // Lend only when every other PC is known, not working, and has had no turn for a while.
-  const isLending = others.length > 0 && others.every(o => !o.isWorking && (o.idleMs === null || o.idleMs >= IDLE_AFTER))
+  // Lend when every other PC is known and either has Claude closed (offline) or has had no turn for a while.
+  const isLending = others.length > 0 && others.every(o => !o.isWorking && (!o.isOnline || o.idleMs === null || o.idleMs >= IDLE_AFTER))
   const cap = round1(isLending ? 100 - others.reduce((n, o) => n + o.mine, 0) : share)
   const left = v.pct === null ? null : Math.max(0, round1(Math.min(cap - v.mine, 100 - v.pct)))
   return { share, cap, left, isLending, synced, others }
@@ -304,4 +304,128 @@ export function sparkline(points: [number, number][], width = 16): string {
     const y = [...points].reverse().find(([pt]) => pt <= t)?.[1] ?? 0
     return bars[Math.min(7, Math.floor((y / max) * 7.99))]
   }).join('')
+}
+
+/** A local calendar day, YYYY-MM-DD. */
+export function dayKey(ms: number): string {
+  const d = new Date(ms)
+  const two = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}`
+}
+
+export const HISTORY_DAYS = 14
+
+/** This PC's own usage per day: total % and % per hour of day. */
+export type Days = Record<string, { pct: number; hours: number[] }>
+
+export function asDays(v: unknown): Days {
+  const out: Days = {}
+  for (const [d, x] of Object.entries((v ?? {}) as Record<string, { pct?: unknown; hours?: unknown }>)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || typeof x?.pct !== 'number') continue
+    const hours = Array.isArray(x.hours) && x.hours.length === 24 ? x.hours.map(h => (typeof h === 'number' ? h : 0)) : Array<number>(24).fill(0)
+    out[d] = { pct: x.pct, hours }
+  }
+  return out
+}
+
+/** Adds one turn's % at `ms`, keeping the last HISTORY_DAYS days. */
+export function addToDays(days: Days, ms: number, pct: number): Days {
+  const key = dayKey(ms)
+  const day = days[key] ?? { pct: 0, hours: Array<number>(24).fill(0) }
+  const hours = [...day.hours]
+  hours[new Date(ms).getHours()]! += pct
+  const next = { ...days, [key]: { pct: day.pct + pct, hours } }
+  // Keep the HISTORY_DAYS days up to the newest one recorded (YYYY-MM-DD sorts by date).
+  const newest = Object.keys(next).sort().at(-1)!
+  const [y, m, dd] = newest.split('-').map(Number)
+  const cutoff = dayKey(new Date(y!, m! - 1, dd! - (HISTORY_DAYS - 1)).getTime())
+  return Object.fromEntries(Object.entries(next).filter(([d]) => d >= cutoff))
+}
+
+/** This PC's % per project in the current 5-hour window, largest first. */
+export function projectsOf(log: Entry[], reading: Reading | null, now: number, rate: number | null): [string, number][] {
+  const resetMs = reading?.resetsAt ? Date.parse(reading.resetsAt) : NaN
+  const windowStart = Number.isFinite(resetMs) && resetMs > now ? resetMs - FIVE_HOURS : now - FIVE_HOURS
+  const by = new Map<string, number>()
+  for (const e of log) {
+    if (e.t < windowStart || e.t > now) continue
+    const own = rate !== null && e.usd !== undefined ? e.usd * rate : (e.d ?? 0)
+    by.set(e.proj ?? 'other', (by.get(e.proj ?? 'other') ?? 0) + own)
+  }
+  return [...by].filter(([, n]) => n > 0).map(([p, n]) => [p, round1(n)] as [string, number]).sort((a, b) => b[1] - a[1])
+}
+
+/** Everything the history pane shows: this PC's projects and hours, and every PC's days. */
+export function historyOf(days: Days, s: Sync, me: string, projects: [string, number][], now: number): History {
+  const keys = Array.from({ length: HISTORY_DAYS }, (_, i) => dayKey(now - (HISTORY_DAYS - 1 - i) * 86_400_000))
+  const perPc: History['days'] = { [me]: Object.fromEntries(keys.map(k => [k, round1(days[k]?.pct ?? 0)])) }
+  for (const [name, st] of Object.entries(s.pcs)) {
+    if (name !== me) perPc[name] = Object.fromEntries(keys.map(k => [k, round1(st.days[k] ?? 0)]))
+  }
+  const hours = Array<number>(24).fill(0)
+  for (const k of keys) days[k]?.hours.forEach((h, i) => (hours[i]! += h))
+  return { projects, days: perPc, hours: hours.map(round1) }
+}
+
+/** The last HISTORY_DAYS days' % for publishing in this PC's status. */
+export const daysForStatus = (days: Days): Record<string, number> => Object.fromEntries(Object.entries(days).map(([d, x]) => [d, round1(x.pct)]))
+
+const esc = (t: string) => t.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+
+/** The history pane as one SVG: projects this window, % per day per PC, this PC by hour. */
+export function historySvg(h: History, me: string): string {
+  const W = 440
+  const pcs = Object.keys(h.days)
+  const colorOf = (pc: string) => (pc === me ? 'me' : 'other')
+  let y = 22
+  let body = `<text class="h" x="0" y="${y}">This 5-hour window by project (this PC)</text>`
+  y += 10
+  const top = h.projects.slice(0, 6)
+  const maxP = Math.max(1, ...top.map(([, n]) => n))
+  if (top.length === 0) body += `<text class="s" x="0" y="${(y += 18)}">No usage yet this window</text>`
+  for (const [name, n] of top) {
+    y += 20
+    const w = Math.max(2, (n / maxP) * 200)
+    body += `<text class="s" x="0" y="${y}">${esc(name.slice(0, 22))}</text><rect class="me" x="150" y="${y - 10}" width="${w.toFixed(1)}" height="12" rx="2"/><text class="v" x="${(156 + w).toFixed(1)}" y="${y}">${n}%</text>`
+  }
+
+  y += 40
+  body += `<text class="h" x="0" y="${y}">Last ${HISTORY_DAYS} days, % of a 5-hour window per day</text>`
+  const days = Object.keys(h.days[me] ?? {})
+  const totals = days.map(d => pcs.reduce((n, pc) => n + (h.days[pc]?.[d] ?? 0), 0))
+  const maxD = Math.max(1, ...totals)
+  const chartH = 90
+  const base = y + 16 + chartH
+  const bw = (W - 20) / Math.max(1, days.length)
+  days.forEach((d, i) => {
+    let top2 = base
+    for (const pc of pcs) {
+      const v = h.days[pc]?.[d] ?? 0
+      const bh = (v / maxD) * chartH
+      if (bh > 0) body += `<rect class="${colorOf(pc)}" x="${(i * bw).toFixed(1)}" y="${(top2 - bh).toFixed(1)}" width="${(bw - 3).toFixed(1)}" height="${bh.toFixed(1)}"/>`
+      top2 -= bh
+    }
+    if (i % 2 === days.length % 2 || i === days.length - 1) body += `<text class="xs" x="${(i * bw + (bw - 3) / 2).toFixed(1)}" y="${base + 12}" text-anchor="middle">${d.slice(8)}</text>`
+  })
+  body += `<line class="d" x1="0" y1="${base}" x2="${W - 20}" y2="${base}"/>`
+  body += `<text class="xs" x="${W - 20}" y="${base - chartH - 4}" text-anchor="end">top ${round1(maxD)}%</text>`
+  y = base + 30
+  pcs.forEach((pc, i) => {
+    body += `<rect class="${colorOf(pc)}" x="${i * 150}" y="${y - 9}" width="10" height="10" rx="2"/><text class="s" x="${i * 150 + 15}" y="${y}">${esc(pc === me ? `${pc} (this PC)` : pc).slice(0, 24)}</text>`
+  })
+
+  y += 40
+  body += `<text class="h" x="0" y="${y}">This PC by hour of day, last ${HISTORY_DAYS} days</text>`
+  const maxH = Math.max(1, ...h.hours)
+  const hb = y + 16 + 60
+  const hw = (W - 20) / 24
+  h.hours.forEach((v, i) => {
+    const bh = (v / maxH) * 60
+    if (bh > 0) body += `<rect class="me" x="${(i * hw).toFixed(1)}" y="${(hb - bh).toFixed(1)}" width="${(hw - 2).toFixed(1)}" height="${bh.toFixed(1)}"/>`
+    if (i % 3 === 0) body += `<text class="xs" x="${(i * hw + (hw - 2) / 2).toFixed(1)}" y="${hb + 12}" text-anchor="middle">${i}</text>`
+  })
+  body += `<line class="d" x1="0" y1="${hb}" x2="${W - 20}" y2="${hb}"/>`
+  const H = hb + 20
+  const style = `.h{fill:#1f1e1d;font:600 13px ${FONT}}.s{fill:#87867f;font:12px ${FONT}}.xs{fill:#87867f;font:10px ${FONT}}.v{fill:#1f1e1d;font:600 12px ${FONT}}.d{stroke:#1f1e1d;stroke-opacity:.15}.me{fill:#2e7d32}.other{fill:#6a5acd}@media (prefers-color-scheme:dark){.h,.v{fill:#ecebe6}.d{stroke:#fff;stroke-opacity:.15}.me{fill:#6abf69}.other{fill:#9d8cff}}`
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}"><style>${style}</style>${body}</svg>`
 }
