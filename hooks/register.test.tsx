@@ -20,6 +20,8 @@ function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<s
   const store = new Map<string, unknown>(Object.entries(o.stored ?? {}))
   const files: Files = { 'README.md': '# sync', ...(o.files ?? {}) }
   let local: Files | null = null
+  // Files outside the clone (the lock), by full path.
+  const outside: Files = {}
   let calls = 0
   const net = { writesDown: false }
   const resetsAt = new Date(Date.now() + 3600_000).toISOString()
@@ -34,9 +36,13 @@ function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<s
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/me' : undefined }))
   on('fs.list', () => ({ value: Object.keys(local ?? {}).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })) }))
-  on('fs.read', (_, e) => ({ value: (local ?? {})[base(e.path)] ?? '' }))
+  on('fs.read', (_, e) => {
+    if (e.path.endsWith('.lock')) return e.path in outside ? { value: outside[e.path]! } : { deny: 'ENOENT' }
+    return { value: (local ?? {})[base(e.path)] ?? '' }
+  })
   on('fs.write', (_, e) => {
-    if (local) local[base(e.path)] = e.text
+    if (e.path.endsWith('.lock')) outside[e.path] = e.text
+    else if (local) local[base(e.path)] = e.text
     return { value: undefined }
   })
   on('process.run', (_, e) => {
@@ -79,7 +85,7 @@ function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<s
   on('session.cwd', () => ({ value: '/home/me/code/my-app' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('prompt.submit', (_, e) => ({ text: e.text }))
-  return { store, files, net }
+  return { store, files, net, outside }
 }
 
 const resetsAt = () => new Date(Date.now() + 3600_000).toISOString()
@@ -194,7 +200,7 @@ test('a limit change GitHub missed is sent again on the next sync', async ($, on
   g.net.writesDown = true
   await $.command.run({ command: 'usage-share', args: '80', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } })
   expect(JSON.parse(g.files['shares.json']!).shares.PCA).toBe(75)
-  expect(g.store.get('pendingShare')).toBe(80)
+  expect((g.store.get('pendingShare') as { share: number }).share).toBe(80)
   const desk = await $.ui.mount({ ...BAND, surface: 'desktop' })
   expect((await desk.find({ type: 'Text', text: /^80%$/ }))?.text).toBe('80%')
   await desk.unmount()
@@ -202,6 +208,7 @@ test('a limit change GitHub missed is sent again on the next sync', async ($, on
   g.net.writesDown = false
   await syncNow($)
   expect(JSON.parse(g.files['shares.json']!).shares).toEqual({ PCA: 80, PCB: 20 })
+  expect(JSON.parse(g.files['shares.json']!).by).toBe('PCA')
   expect(g.store.get('pendingShare')).toBe(undefined)
 })
 
@@ -224,5 +231,31 @@ test('the History pane shows projects, both PCs per day, and hours', async ($, o
   const term = await $.ui.mount({ ...pane, surface: 'terminal' })
   expect((await term.find({ type: 'Text', text: /my-app/ }))?.text).toContain('6%')
   expect((await term.find({ type: 'Text', text: /PCB/ }))?.text).toBeDefined()
+  await term.unmount()
+})
+
+test('an old limit kept by another session never overwrites a newer one; every session follows GitHub', async ($, on) => {
+  const now = Date.now()
+  const g = engine(on, {
+    pct: 10,
+    // This session started with 70 and has an unsent change to 90 from 10 minutes ago...
+    stored: { prefs: { share: 70 }, pendingShare: { share: 90, at: now - 10 * MIN } },
+    // ...but 65 was set 1 minute ago (by another session or the other PC).
+    files: { 'shares.json': JSON.stringify({ shares: { PCA: 65, PCB: 35 }, at: now - MIN, by: 'PCA' }), 'pc-PCB.json': otherPc({}) },
+  })
+  await startSynced($)
+  expect(JSON.parse(g.files['shares.json']!).shares).toEqual({ PCA: 65, PCB: 35 })
+  expect(g.store.get('pendingShare')).toBe(undefined)
+  expect((g.store.get('prefs') as { share: number }).share).toBe(65)
+})
+
+test('another session on this PC syncing right now: skipped, not shown as an error', async ($, on) => {
+  const g = engine(on, { pct: 10, stored: { prefs: { share: 70 } }, files: { 'shares.json': JSON.stringify({ shares: { PCA: 70, PCB: 30 } }), 'pc-PCB.json': otherPc({ busy: true }) } })
+  await startSynced($)
+  g.outside['/home/me/.claude/usage-guard-sync.lock'] = JSON.stringify({ owner: 'someone-else', t: Date.now() })
+  const said = await syncNow($)
+  expect(said.text).not.toContain('Not synced')
+  const term = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect((await term.find({ type: 'Text', text: /Other PC/ }))?.text).toContain('● working')
   await term.unmount()
 })

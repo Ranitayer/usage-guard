@@ -64,6 +64,9 @@ export type Sync = {
   at: number
   /** Share in % per PC name. */
   shares: Record<string, number>
+  /** When the shares were last set (ms) and by which PC: the newest setting wins. */
+  sharesAt: number
+  sharesBy: string | null
   /** Every PC's status, this one included. */
   pcs: Record<string, PcStatus>
 }

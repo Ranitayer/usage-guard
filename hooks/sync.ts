@@ -12,7 +12,10 @@ const GIT_ENV = { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }
 // Only the GitHub CLI's sign-in, whatever other credential helpers the PC has.
 const CRED = ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential']
 
-export const EMPTY_SYNC: Sync = { me: null, error: null, at: 0, shares: {}, pcs: {} }
+export const EMPTY_SYNC: Sync = { me: null, error: null, at: 0, shares: {}, sharesAt: 0, sharesBy: null, pcs: {} }
+
+/** Thrown when another Claude session on this PC is syncing right now: skip this round, it is not a failure. */
+export const BUSY = 'sync busy'
 
 /** A PC name safe in a file name. */
 export const pcName = (raw: string) => raw.trim().replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 40) || 'pc'
@@ -39,27 +42,27 @@ export function asStatus(text: string | undefined): PcStatus | null {
   }
 }
 
-/** Shares file: only whole numbers 1..99 count. */
-export function asShares(text: string | undefined): Record<string, number> {
+/** Shares file: only whole numbers 1..99 count; `at`/`by` say when and where they were set. */
+export function asShares(text: string | undefined): Pick<Sync, 'shares' | 'sharesAt' | 'sharesBy'> {
   try {
-    const v = JSON.parse(text ?? '') as { shares?: Record<string, unknown> }
-    const out: Record<string, number> = {}
-    for (const [k, n] of Object.entries(v.shares ?? {})) if (typeof n === 'number' && n >= 1 && n <= 99) out[pcName(k)] = Math.round(n)
-    return out
+    const v = JSON.parse(text ?? '') as { shares?: Record<string, unknown>; at?: unknown; by?: unknown }
+    const shares: Record<string, number> = {}
+    for (const [k, n] of Object.entries(v.shares ?? {})) if (typeof n === 'number' && n >= 1 && n <= 99) shares[pcName(k)] = Math.round(n)
+    return { shares, sharesAt: asNumber(v.at), sharesBy: typeof v.by === 'string' ? v.by : null }
   } catch {
-    return {}
+    return { shares: {}, sharesAt: 0, sharesBy: null }
   }
 }
 
 /** The sync repo's files (name → text) into shares and statuses. */
-export function parseFiles(files: Record<string, string>): Pick<Sync, 'shares' | 'pcs'> {
+export function parseFiles(files: Record<string, string>): Pick<Sync, 'shares' | 'sharesAt' | 'sharesBy' | 'pcs'> {
   const pcs: Record<string, PcStatus> = {}
   for (const [file, text] of Object.entries(files)) {
     const m = /^pc-(.+)\.json$/.exec(file)
     const s = m ? asStatus(text) : null
     if (m && s) pcs[m[1]!] = s
   }
-  return { shares: asShares(files['shares.json']), pcs }
+  return { ...asShares(files['shares.json']), pcs }
 }
 
 /** Shares after this PC picks `share`: the rest is split evenly over the other PCs. */
@@ -84,7 +87,14 @@ export function gitError(stderr: string): string {
 }
 
 /** Where the local copy of the sync repo lives: <home>/.claude/usage-guard-sync, outside the watched plugin folder. */
-export type SyncRepoState = { dir: string | null }
+export type SyncRepoState = { dir: string | null; session: string; queue?: Promise<unknown> }
+
+/** One git operation at a time within this session; `withLock` does the same across sessions. */
+function serial<T>(st: SyncRepoState, fn: () => Promise<T>): Promise<T> {
+  const run = (st.queue ?? Promise.resolve()).then(fn)
+  st.queue = run.catch(() => undefined)
+  return run
+}
 
 async function git($: EngineInterface, args: string[], network = false): Promise<string> {
   let err = ''
@@ -126,9 +136,38 @@ async function latest($: EngineInterface, dir: string) {
   await git($, ['-C', dir, 'reset', '-q', '--hard', 'origin/main'])
 }
 
+/**
+ * One Claude session at a time uses the clone: several sessions on one PC each run this plugin.
+ * shortcut: write-then-read-back, not an atomic lock; two sessions in the same millisecond can both pass, which
+ * at worst costs one sync round (every write starts over from GitHub's latest).
+ */
+async function withLock<T>($: EngineInterface, dir: string, me: string, fn: () => Promise<T>): Promise<T> {
+  const path = `${dir}.lock`
+  const now = await $.clock.now()
+  const held = await $.fs
+    .read(path)
+    .then(t => JSON.parse(t) as { owner?: string; t?: number })
+    .catch(() => null)
+  if (held?.owner && held.owner !== me && now - (held.t ?? 0) < 60_000) throw new Error(BUSY)
+  await $.fs.write(path, JSON.stringify({ owner: me, t: now }))
+  const mine = await $.fs.read(path).then(t => (JSON.parse(t) as { owner?: string }).owner === me).catch(() => false)
+  if (!mine) throw new Error(BUSY)
+  try {
+    return await fn()
+  } finally {
+    await $.fs.write(path, JSON.stringify({ owner: '', t: 0 })).catch(() => undefined)
+  }
+}
+
 /** Every PC's status and the shares, from GitHub's latest. */
-export async function readSync($: EngineInterface, st: SyncRepoState): Promise<Pick<Sync, 'shares' | 'pcs'>> {
-  const dir = await repo($, st)
+export async function readSync($: EngineInterface, st: SyncRepoState): Promise<Pick<Sync, 'shares' | 'sharesAt' | 'sharesBy' | 'pcs'>> {
+  return serial(st, async () => {
+    const dir = await repo($, st)
+    return withLock($, dir, st.session, () => readNow($, dir))
+  })
+}
+
+async function readNow($: EngineInterface, dir: string) {
   await latest($, dir)
   const files: Record<string, string> = {}
   for (const f of await $.fs.list(dir)) {
@@ -142,7 +181,13 @@ export async function readSync($: EngineInterface, st: SyncRepoState): Promise<P
  * newer files are kept and the push never conflicts; a push the other PC beat is simply tried again.
  */
 export async function writeSync($: EngineInterface, st: SyncRepoState, files: Record<string, unknown>): Promise<void> {
-  const dir = await repo($, st)
+  return serial(st, async () => {
+    const dir = await repo($, st)
+    return withLock($, dir, st.session, () => writeNow($, dir, files))
+  })
+}
+
+async function writeNow($: EngineInterface, dir: string, files: Record<string, unknown>): Promise<void> {
   let err: unknown = null
   for (let i = 0; i < TRIES; i++) {
     try {

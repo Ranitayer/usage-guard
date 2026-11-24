@@ -14,6 +14,8 @@ const synced = (other: Partial<Sync['pcs'][string]>, shares = { A: 70, B: 30 }):
   error: null,
   at: NOW - MIN,
   shares,
+  sharesAt: NOW - 60 * MIN,
+  sharesBy: 'A',
   pcs: { A: status(), B: status(other) },
 })
 
@@ -120,11 +122,12 @@ test('rate: median of samples; whole-% readings need a 1% rise', async () => {
 
 test('sync files: bad content is ignored, names are made safe; repo address and errors', async () => {
   const g = parseFiles({
-    'shares.json': JSON.stringify({ shares: { A: 70, B: 30, C: 500 } }),
+    'shares.json': JSON.stringify({ shares: { A: 70, B: 30, C: 500 }, at: 123, by: 'B' }),
     'pc-A.json': JSON.stringify({ t: 5, busy: true, updated: 6, mine: 12.5, resetsAt, samples: [2, -1, 'x'], days: { '2026-11-24': 3, bad: 1 } }),
     'pc-B.json': 'not json',
   })
   expect(g.shares).toEqual({ A: 70, B: 30 })
+  expect([g.sharesAt, g.sharesBy]).toEqual([123, 'B'])
   expect(Object.keys(g.pcs)).toEqual(['A'])
   expect(g.pcs.A!.samples).toEqual([2])
   expect(g.pcs.A!.days).toEqual({ '2026-11-24': 3 })

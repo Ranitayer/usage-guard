@@ -2,9 +2,10 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
 import type { History, Prefs, Sync, View } from '../types'
-import { EMPTY_SYNC, pcName, readSync, sharesFor, writeSync } from './sync'
+import { BUSY, EMPTY_SYNC, pcName, readSync, sharesFor, writeSync } from './sync'
 import type { SyncRepoState } from './sync'
 import {
+  BUSY_STALE,
   DEFAULT_PREFS,
   addToDays,
   asDays,
@@ -97,16 +98,39 @@ async function refresh($: EngineInterface): Promise<View> {
   return v
 }
 
+/** A limit change waiting to reach GitHub, stamped so an older one never overwrites a newer one. */
+type Pending = { share: number; at: number }
+const asPending = (v: unknown): Pending | null =>
+  typeof (v as Pending)?.share === 'number' && typeof (v as Pending)?.at === 'number' ? (v as Pending) : null
+
+/** "sync busy" means another session on this PC is syncing: skip the round, keep the last state and error. */
+const errorOf = (err: unknown, prev: string | null) => {
+  const msg = err instanceof Error ? err.message : 'sync failed'
+  return msg === BUSY ? prev : msg
+}
+
+// A Claude session on this PC counts as working while it has a fresh entry here (shared by every session on the PC).
+async function markBusy($: EngineInterface, busy: boolean) {
+  const now = await $.clock.now()
+  const all = ((await $.store.get('busySessions')) ?? {}) as Record<string, number>
+  const next = Object.fromEntries(Object.entries(all).filter(([k, t]) => k !== live.session && now - t < BUSY_STALE))
+  if (busy) next[live.session] = now
+  await $.store.set('busySessions', next)
+  return Object.keys(next).length > 0
+}
+
 // Sync state for this load of the module (a reload starts it over, which only costs one extra read).
 const live: {
   repo: SyncRepoState | null
+  /** This Claude session, among the others on this PC. */
+  session: string
   busy: boolean
   pulling: Promise<void> | null
   lastPull: number
   lastBeat: number
   lastPush: number
   queue: Promise<void>
-} = { repo: null, busy: false, pulling: null, lastPull: 0, lastBeat: 0, lastPush: 0, queue: Promise.resolve() }
+} = { repo: null, session: Math.random().toString(36).slice(2, 10), busy: false, pulling: null, lastPull: 0, lastBeat: 0, lastPush: 0, queue: Promise.resolve() }
 
 /** Reads both PCs' state from the sync repo into the band; a failure only marks the band "not synced". */
 async function pull($: EngineInterface, force = false) {
@@ -127,13 +151,18 @@ async function pullNow($: EngineInterface, now: number) {
   try {
     const remote = await readSync($, live.repo)
     const s = await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, ...remote, error: null, at: now }))
-    // A limit change not yet saved to the sync repo wins over what the gist says, and is sent again.
-    const pending = await $.store.get('pendingShare')
-    if (typeof pending === 'number') await pushShares($, pending)
+    // A limit change not yet on GitHub is sent again, unless a newer one (from any PC or session) is already there.
+    const pending = asPending(await $.store.get('pendingShare'))
+    const isNewer = pending !== null && pending.at > remote.sharesAt
+    if (pending && isNewer) await pushShares($, pending.share, pending.at)
+    else if (pending) await $.store.delete('pendingShare')
     // First time this PC shows up: claim its share so the other PC's adds up to 100.
-    else if (s.me && remote.shares[s.me] === undefined) await pushShares($, asPrefs(await read($, prefsAtom)).share)
+    else if (s.me && remote.shares[s.me] === undefined) await pushShares($, asPrefs(await read($, prefsAtom)).share, now)
+    // Every session follows GitHub's limit, so one started earlier never sends back an old value.
+    const synced = s.me ? remote.shares[s.me] : undefined
+    if (!isNewer && synced !== undefined && synced !== asPrefs(await read($, prefsAtom)).share) await savePrefs($, x => ({ ...x, share: synced }))
   } catch (err) {
-    await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, error: err instanceof Error ? err.message : 'sync failed' }))
+    await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, error: errorOf(err, x.error) }))
   }
   await refresh($).catch(() => undefined)
 }
@@ -160,7 +189,7 @@ async function pushNow($: EngineInterface) {
   live.lastPush = now
   const status = {
     t: Number((await $.store.get('lastTurn')) ?? 0),
-    busy: live.busy,
+    busy: await markBusy($, live.busy),
     updated: now,
     mine: v.mine,
     resetsAt: v.resetsAt,
@@ -171,30 +200,32 @@ async function pushNow($: EngineInterface) {
     await writeSync($, live.repo, { [`pc-${s.me}.json`]: status })
     await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, pcs: { ...x.pcs, [s.me!]: status } }))
   } catch (err) {
-    await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, error: err instanceof Error ? err.message : 'sync failed' }))
+    await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, error: errorOf(err, x.error) }))
   }
 }
 
-/** Sets this PC's share and gives the rest to the other PC(s), on both sides. */
-async function pushShares($: EngineInterface, share: number) {
+/** Sets this PC's share (set at `at`) and gives the rest to the other PC(s), on both sides. */
+async function pushShares($: EngineInterface, share: number, at: number) {
   const s = await loadSync($)
   if (!live.repo || !s.me) return
   const shares = sharesFor(s.me, share, Object.keys(s.pcs).filter(n => n !== s.me))
-  await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, shares }))
+  await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, shares, sharesAt: at, sharesBy: s.me }))
   // Kept until GitHub has it, so a dropped request is retried on the next sync instead of lost.
-  await $.store.set('pendingShare', share)
+  await $.store.set('pendingShare', { share, at })
   try {
-    await writeSync($, live.repo, { 'shares.json': { shares } })
-    await $.store.delete('pendingShare')
+    await writeSync($, live.repo, { 'shares.json': { shares, at, by: s.me } })
+    // Cleared only if no newer change was made meanwhile.
+    if (asPending(await $.store.get('pendingShare'))?.at === at) await $.store.delete('pendingShare')
   } catch {
     // Left pending: the next pull sends it again.
   }
 }
 
 async function setShare($: EngineInterface, n: number) {
-  const share = Math.min(100, Math.max(STEP, n))
+  // At most 95: the other PC always keeps a part (a 100/0 split would drop both from the file).
+  const share = Math.min(100 - STEP, Math.max(STEP, n))
   await savePrefs($, x => ({ ...x, share }))
-  await pushShares($, share)
+  await pushShares($, share, await $.clock.now())
   await refresh($).catch(() => undefined)
 }
 
@@ -228,7 +259,7 @@ export const register: Register = on => {
       await $.store.set('pcName', me)
     }
     await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, me: me as string }))
-    live.repo = { dir: null }
+    live.repo = { dir: null, session: live.session }
     // Background sync never throws: a failure only shows as "not synced" on the band.
     void pull($, true).then(() => push($)).catch(() => undefined)
     $.clock.every(PULL_EVERY, () => void tick($).catch(() => undefined))
