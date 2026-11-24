@@ -1,0 +1,6 @@
+{
+  "name": "usage-guard",
+  "version": "0.1.0",
+  "description": "Shows 5-hour usage, tokens and usage per 15 minutes above the prompt, and blocks prompts past a limit you pick.",
+  "types": "./types/index.d.ts"
+}
