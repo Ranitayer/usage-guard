@@ -81,6 +81,8 @@ test('other PC: working, online, offline; one failed check keeps the last state'
   expect(say(synced({ updated: NOW - 90 * MIN, t: NOW - 95 * MIN }))).toEqual({ value: 'offline', sub: 'lending to you'.replace(/^/, 'idle 1h 35m · '), tone: 'warning' })
   // offline: lends right away
   expect(say(synced({ updated: NOW - 20 * MIN, t: NOW - 20 * MIN }))).toEqual({ value: 'offline', sub: 'idle 20m · lending to you', tone: 'warning' })
+  // last read says offline, but the latest sync failed: say why instead of a plain "offline"
+  expect(say({ ...synced({ updated: NOW - 20 * MIN, t: NOW - 20 * MIN }), error: 'no home folder' })).toEqual({ value: 'offline?', sub: 'sync: no home folder', tone: 'warning' })
   // a failed check 1 min after a good read still shows the other PC
   expect(say({ ...synced({ busy: true }), error: 'GitHub not reachable' }).value).toBe('● working')
 })

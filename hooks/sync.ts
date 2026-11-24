@@ -83,7 +83,7 @@ export function gitError(stderr: string): string {
   return 'GitHub not reachable'
 }
 
-/** Where the local copy of the sync repo lives (the plugin's data folder, outside the watched plugin folder). */
+/** Where the local copy of the sync repo lives: <home>/.claude/usage-guard-sync, outside the watched plugin folder. */
 export type SyncRepoState = { dir: string | null }
 
 async function git($: EngineInterface, args: string[], network = false): Promise<string> {
@@ -107,9 +107,10 @@ async function repo($: EngineInterface, st: SyncRepoState): Promise<string> {
   const origin = await $.process.run(['git', '-C', $.plugin.root, 'remote', 'get-url', 'origin']).catch(() => null)
   const url = origin?.exitCode === 0 ? syncUrl(origin.stdout) : null
   if (!url) throw new Error('reinstall with git clone (see README)')
-  const data = (await $.process.hookEnv()).CLAUDE_PLUGIN_DATA
-  if (!data) throw new Error('no plugin data folder')
-  const dir = `${data}/sync`
+  // A fixed folder next to Claude's own (the plugin's data folder is not given to every kind of install).
+  const home = (await $.env.get('HOME')) ?? (await $.env.get('USERPROFILE'))
+  if (!home) throw new Error('no home folder')
+  const dir = `${home}/.claude/usage-guard-sync`
   const isClone = await $.process.run(['git', '-C', dir, 'rev-parse', '--is-inside-work-tree']).then(r => r.exitCode === 0).catch(() => false)
   if (!isClone) {
     await git($, ['clone', '-q', '--depth', '1', url, dir], true)

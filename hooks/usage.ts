@@ -202,7 +202,9 @@ export const toneOf = (frac: number) => (frac >= 1 ? 'error' : frac >= 0.8 ? 'wa
 export function otherText(pl: Plan, s: Sync, now: number): { value: string; sub: string; tone?: 'success' | 'warning' } {
   if (!pl.synced) return { value: 'not synced', sub: s.at === 0 ? (s.error ?? 'connecting…') : 'GitHub not reachable' }
   const o = pl.others[0]
-  if (!o) return { value: 'not seen yet', sub: 'install it on the other PC' }
+  if (!o) return { value: 'not seen yet', sub: s.error ?? 'install it on the other PC' }
+  // Still showing the last good read, but the latest one failed: say why.
+  if (s.error !== null && !o.isWorking && !o.isOnline) return { value: 'offline?', sub: `sync: ${s.error}`, tone: 'warning' }
   const usedText = `${o.mine}% of ${o.share}%`
   const idle = o.idleMs === null ? 'idle' : `idle ${fmtDur(o.idleMs)}`
   if (o.isWorking) return { value: '● working', sub: usedText, tone: 'success' }

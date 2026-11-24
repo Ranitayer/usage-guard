@@ -32,7 +32,7 @@ function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<s
   on('command.register', (_, e) => ({ value: { command: e.name } }))
   on('ui.toast', () => ({ value: undefined }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
-  on('process.hookEnv', () => ({ value: { CLAUDE_PLUGIN_DATA: '/data' } }))
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/me' : undefined }))
   on('fs.list', () => ({ value: Object.keys(local ?? {}).map(name => ({ name, kind: 'file' as const, size: 1, mtimeMs: 0, isLink: false })) }))
   on('fs.read', (_, e) => ({ value: (local ?? {})[base(e.path)] ?? '' }))
   on('fs.write', (_, e) => {
