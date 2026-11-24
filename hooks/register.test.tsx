@@ -18,6 +18,7 @@ type Files = Record<string, string>
  */
 function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<string, unknown>; files?: Files; offline?: boolean; flaky?: boolean }) {
   let calls = 0
+  const net = { writesDown: false }
   const store = new Map<string, unknown>(Object.entries(o.stored ?? {}))
   const files: Files = { ...(o.files ?? {}) }
   const hasGist = { v: o.files !== undefined }
@@ -50,6 +51,7 @@ function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<s
       return reply({ id: 'g1' }, 201)
     }
     if (e.url.endsWith('/gists/g1') && method === 'PATCH') {
+      if (net.writesDown) throw new Error('connect timeout')
       const body = JSON.parse(String(e.init?.body)) as { files: Record<string, { content: string }> }
       for (const [n, f] of Object.entries(body.files)) files[n] = f.content
       return reply({ id: 'g1' })
@@ -70,7 +72,7 @@ function engine(on: Parameters<TestBody>[1], o: { pct: number; stored?: Record<s
   }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('prompt.submit', (_, e) => ({ text: e.text }))
-  return { store, files }
+  return { store, files, net }
 }
 
 const resetsAt = () => new Date(Date.now() + 3600_000).toISOString()
@@ -174,4 +176,22 @@ test('a flaky network: each GitHub call is retried, and the other PC still shows
   const term = await $.ui.mount({ ...BAND, surface: 'terminal' })
   expect((await term.find({ type: 'Text', text: /Other PC/ }))?.text).toContain('● working')
   await term.unmount()
+})
+
+test('a limit change GitHub missed is sent again on the next sync', async ($, on) => {
+  const g = engine(on, { pct: 10, stored: { prefs: { share: 75 } }, files: { 'shares.json': JSON.stringify({ shares: { PCA: 75, PCB: 25 } }), 'pc-PCB.json': otherPc({}) } })
+  await startSynced($)
+  // GitHub takes no writes: the change to 80 stays unsaved, but this PC keeps showing it.
+  g.net.writesDown = true
+  await $.command.run({ command: 'usage-share', args: '80', origin: { kind: 'composer' }, presentation: { isFullscreen: false, columns: 100 } })
+  expect(JSON.parse(g.files['shares.json']!).shares.PCA).toBe(75)
+  expect(g.store.get('pendingShare')).toBe(80)
+  const desk = await $.ui.mount({ ...BAND, surface: 'desktop' })
+  expect((await desk.find({ type: 'Text', text: /^80%$/ }))?.text).toBe('80%')
+  await desk.unmount()
+  // GitHub is back: the next sync saves it.
+  g.net.writesDown = false
+  await syncNow($)
+  expect(JSON.parse(g.files['shares.json']!).shares).toEqual({ PCA: 80, PCB: 20 })
+  expect(g.store.get('pendingShare')).toBe(undefined)
 })

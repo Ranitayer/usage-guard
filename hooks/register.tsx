@@ -32,7 +32,7 @@ const STEP = 5
 // Until a rate is known: a response more than this after the last one is not counted to this PC.
 const GAP = 2 * 60_000
 // Read the gist at most this often unless something changed here.
-const PULL_EVERY = 60_000
+const PULL_EVERY = 30_000
 // While a turn runs, re-say "working" this often so a long turn never looks idle.
 const HEARTBEAT = 2 * 60_000
 
@@ -98,8 +98,11 @@ async function pull($: EngineInterface, force = false) {
   try {
     const remote = await readGist($, live.gist)
     const s = await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, ...remote, error: null, at: now }))
+    // A limit change not yet saved to the gist wins over what the gist says, and is sent again.
+    const pending = await $.store.get('pendingShare')
+    if (typeof pending === 'number') await pushShares($, pending)
     // First time this PC shows up: claim its share so the other PC's adds up to 100.
-    if (s.me && remote.shares[s.me] === undefined) await pushShares($, asPrefs(await read($, prefsAtom)).share)
+    else if (s.me && remote.shares[s.me] === undefined) await pushShares($, asPrefs(await read($, prefsAtom)).share)
   } catch (err) {
     await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, error: err instanceof Error ? err.message : 'sync failed' }))
   }
@@ -141,7 +144,14 @@ async function pushShares($: EngineInterface, share: number) {
   if (!live.gist || !s.me) return
   const shares = sharesFor(s.me, share, Object.keys(s.pcs).filter(n => n !== s.me))
   await update($, syncAtom, x => ({ ...EMPTY_SYNC, ...x, shares }))
-  await writeGist($, live.gist, { 'shares.json': { shares } }).catch(() => undefined)
+  // Kept until GitHub has it, so a dropped request is retried on the next sync instead of lost.
+  await $.store.set('pendingShare', share)
+  try {
+    await writeGist($, live.gist, { 'shares.json': { shares } })
+    await $.store.delete('pendingShare')
+  } catch {
+    // Left pending: the next pull sends it again.
+  }
 }
 
 async function setShare($: EngineInterface, n: number) {
