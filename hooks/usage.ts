@@ -125,9 +125,10 @@ export function othersOf(s: Sync, myShare: number, now: number): Other[] {
       name,
       share: s.shares[name] ?? Math.round((100 - myShare) / names.length),
       mine: windowOver ? 0 : st.mine,
-      isWorking: st.busy && now - st.updated < BUSY_STALE,
-      // Claude open there: it sends a status every minute.
-      isOnline: now - st.updated < ONLINE_FOR,
+      // Judged at the last good read, so this PC's own network trouble does not make the other PC look offline.
+      isWorking: st.busy && s.at - st.updated < BUSY_STALE,
+      // Claude open there: it sends a status every 2 minutes.
+      isOnline: s.at - st.updated < ONLINE_FOR,
       seenMs: now - st.updated,
       idleMs: st.t > 0 ? now - st.t : null,
     }
@@ -200,12 +201,11 @@ export const toneOf = (frac: number) => (frac >= 1 ? 'error' : frac >= 0.8 ? 'wa
 
 /** The other PC's state in a few words. */
 export function otherText(pl: Plan, s: Sync, now: number): { value: string; sub: string; tone?: 'success' | 'warning' } {
-  if (!pl.synced) return { value: 'not synced', sub: s.at === 0 ? (s.error ?? 'connecting…') : 'GitHub not reachable' }
+  if (!pl.synced) return { value: 'not synced', sub: s.at === 0 ? (s.error ?? 'connecting…') : `${s.error ?? 'GitHub unreachable'} · retrying` }
   const o = pl.others[0]
   if (!o) return { value: 'not seen yet', sub: s.error ?? 'install it on the other PC' }
-  // Still showing the last good read, but the latest one failed: say why.
-  if (s.error !== null && !o.isWorking && !o.isOnline) return { value: 'offline?', sub: `sync: ${s.error}`, tone: 'warning' }
-  const usedText = `${o.mine}% of ${o.share}%`
+  // The latest sync failed: show the last good read, and how old it is.
+  const usedText = s.error !== null ? `synced ${fmtDur(now - s.at)} ago · retrying` : `${o.mine}% of ${o.share}%`
   const idle = o.idleMs === null ? 'idle' : `idle ${fmtDur(o.idleMs)}`
   if (o.isWorking) return { value: '● working', sub: usedText, tone: 'success' }
   const value = o.isOnline ? '● online' : 'offline'

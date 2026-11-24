@@ -5,8 +5,11 @@ import type { PcStatus, Sync } from '../types'
 /** The private repo both PCs share sits next to this plugin's own repo: <owner>/usage-guard-sync. */
 export const SYNC_REPO = 'usage-guard-sync'
 // Some networks drop a share of connections to GitHub: each network call tries this many times, this long each.
-const TRIES = 3
-const TRY_TIMEOUT = 20_000
+// A working connection to GitHub answers in well under a second, so a try that hangs is given up quickly.
+const TRIES = 6
+const TRY_TIMEOUT = 8_000
+// Local git work and a first clone may take longer than one network try.
+const LOCAL_TIMEOUT = 30_000
 // Never ask on a terminal or in a window: a PC without a sign-in just reads "not synced".
 const GIT_ENV = { GIT_TERMINAL_PROMPT: '0', GCM_INTERACTIVE: 'never' }
 // Only the GitHub CLI's sign-in, whatever other credential helpers the PC has.
@@ -99,7 +102,8 @@ function serial<T>(st: SyncRepoState, fn: () => Promise<T>): Promise<T> {
 async function git($: EngineInterface, args: string[], network = false): Promise<string> {
   let err = ''
   for (let i = 0; i < (network ? TRIES : 1); i++) {
-    const r = await $.process.run(['git', ...CRED, ...args], { env: GIT_ENV, timeoutMs: TRY_TIMEOUT }).catch((e: unknown) => {
+    const timeoutMs = network && args[0] !== 'clone' ? TRY_TIMEOUT : LOCAL_TIMEOUT
+    const r = await $.process.run(['git', ...CRED, ...args], { env: GIT_ENV, timeoutMs }).catch((e: unknown) => {
       err = e instanceof Error ? e.message : String(e)
       return null
     })
@@ -189,7 +193,8 @@ export async function writeSync($: EngineInterface, st: SyncRepoState, files: Re
 
 async function writeNow($: EngineInterface, dir: string, files: Record<string, unknown>): Promise<void> {
   let err: unknown = null
-  for (let i = 0; i < TRIES; i++) {
+  // The whole write is tried a few times more, for a push the other PC beat.
+  for (let i = 0; i < 3; i++) {
     try {
       await latest($, dir)
       for (const [name, v] of Object.entries(files)) await $.fs.write(`${dir}/${name}`, JSON.stringify(v))
