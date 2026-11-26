@@ -35,6 +35,17 @@ test('own usage: cost × rate, last 15 min, line over the window', async () => {
   expect(summarize([{ t: NOW - MIN, tok: 1, out: 1, pct: 5, d: 1.5, usd: 9 }], { pct: 5, resetsAt }, NOW).mine).toBe(1.5)
 })
 
+test("this PC's estimate never exceeds the account; long idles read in days", async () => {
+  // $20 at 2%/$ would be 40%, but the account only reached 26%: this PC used at most 26%.
+  const v = summarize([{ t: NOW - 20 * MIN, tok: 1, out: 1, pct: 26, usd: 20 }], { pct: 26, resetsAt }, NOW, null, 2)
+  expect(v.mine).toBe(26)
+  expect(v.points.at(-1)![1]).toBe(26)
+  const offline = synced({ updated: NOW - 25 * 60 * MIN, t: NOW - 25 * 60 * MIN })
+  const pl = plan(v, { ...P, share: 50 }, offline, NOW)
+  expect(pl.isLending).toBe(true)
+  expect(otherText(pl, offline, NOW).sub).toBe('idle 1d 1h · lends you')
+})
+
 test('a window that already reset reads 0%', async () => {
   const old = new Date(NOW - MIN).toISOString()
   const v = summarize([{ t: NOW - 6 * 60 * MIN, tok: 5, out: 1, pct: 90, usd: 9 }], { pct: 90, resetsAt: old }, NOW, null, 2)
@@ -80,9 +91,9 @@ test('other PC: working, online, offline; one failed check keeps the last state'
   const say = (s: Sync) => otherText(plan(v, P, s, NOW), s, NOW)
   expect(say(synced({ busy: true, updated: NOW - MIN })).value).toBe('● working')
   expect(say(synced({ updated: NOW - 2 * MIN, t: NOW - 12 * MIN }))).toEqual({ value: '● online', sub: 'idle 12m · 0% of 30%' })
-  expect(say(synced({ updated: NOW - 90 * MIN, t: NOW - 95 * MIN }))).toEqual({ value: 'offline', sub: 'lending to you'.replace(/^/, 'idle 1h 35m · '), tone: 'warning' })
+  expect(say(synced({ updated: NOW - 90 * MIN, t: NOW - 95 * MIN }))).toEqual({ value: 'offline', sub: 'idle 1h 35m · lends you', tone: 'warning' })
   // offline: lends right away
-  expect(say(synced({ updated: NOW - 20 * MIN, t: NOW - 20 * MIN }))).toEqual({ value: 'offline', sub: 'idle 20m · lending to you', tone: 'warning' })
+  expect(say(synced({ updated: NOW - 20 * MIN, t: NOW - 20 * MIN }))).toEqual({ value: 'offline', sub: 'idle 20m · lends you', tone: 'warning' })
   // the latest sync failed 4 min after a good read: the other PC still shows as it was then, with the read's age
   expect(say({ ...synced({ busy: true, updated: NOW - 5 * MIN }), at: NOW - 4 * MIN, error: 'GitHub unreachable' })).toEqual({
     value: '● working',
@@ -193,7 +204,7 @@ test('drawing: own ring, share line, sparkline', async () => {
   const empty = gaugeSvg(EMPTY_VIEW, plan(EMPTY_VIEW, P, s, NOW), s, NOW)
   expect(empty).not.toContain('class="k ')
   expect(empty).toContain('● working')
-  const v = summarize([{ t: NOW - 30 * MIN, tok: 1, out: 1, pct: 50, usd: 40 }], { pct: 70, resetsAt, week: 40 }, NOW, null, 2)
+  const v = summarize([{ t: NOW - 30 * MIN, tok: 1, out: 1, pct: 85, usd: 40 }], { pct: 85, resetsAt, week: 40 }, NOW, null, 2)
   const full = gaugeSvg(v, plan(v, P, s, NOW), s, NOW)
   expect(full).toContain('class="k error"')
   expect(full).toContain('>80%</text>')

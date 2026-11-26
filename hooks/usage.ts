@@ -92,7 +92,8 @@ export function summarize(log: Entry[], reading: Reading | null, now: number, co
   const points: [number, number][] = [[0, 0]]
   let sum = 0
   for (const e of inWindow) {
-    sum += own(e)
+    // This PC can never have used more than the whole account had at that moment: the cost estimate is capped by it.
+    sum = Math.min(sum + own(e), e.pct ?? Infinity)
     points.push([(e.t - windowStart) / FIVE_HOURS, round1(sum)])
   }
   if (inWindow.length > 0) points.push([Math.min(1, (now - windowStart) / FIVE_HOURS), round1(sum)])
@@ -104,7 +105,7 @@ export function summarize(log: Entry[], reading: Reading | null, now: number, co
     tokens15: recent.reduce((n, e) => n + e.tok, 0),
     out15: recent.reduce((n, e) => n + e.out, 0),
     tokensWindow: inWindow.reduce((n, e) => n + e.tok, 0),
-    mine: round1(sum),
+    mine: round1(pct === null ? sum : Math.min(sum, pct)),
     mine15: round1(recent.reduce((n, e) => n + own(e), 0)),
     isCalibrated: rate !== null,
     points: points.slice(-120),
@@ -165,6 +166,7 @@ export const fmtTokens = (n: number) =>
 
 export const fmtDur = (ms: number) => {
   const mins = Math.max(0, Math.round(ms / 60_000))
+  if (mins >= 1440) return `${Math.floor(mins / 1440)}d ${Math.floor((mins % 1440) / 60)}h`
   return mins >= 60 ? `${Math.floor(mins / 60)}h ${mins % 60}m` : `${mins}m`
 }
 
@@ -209,7 +211,7 @@ export function otherText(pl: Plan, s: Sync, now: number): { value: string; sub:
   const idle = o.idleMs === null ? 'idle' : `idle ${fmtDur(o.idleMs)}`
   if (o.isWorking) return { value: '● working', sub: usedText, tone: 'success' }
   const value = o.isOnline ? '● online' : 'offline'
-  if (pl.isLending) return { value, sub: `${idle} · lending to you`, tone: 'warning' }
+  if (pl.isLending) return { value, sub: `${idle} · lends you`, tone: 'warning' }
   return { value, sub: o.isOnline ? `${idle} · ${usedText}` : `seen ${fmtDur(o.seenMs)} ago · ${usedText}` }
 }
 
@@ -220,7 +222,13 @@ export function figures(v: View, pl: Plan, s: Sync, now: number) {
   const forecast = pace(v, pl, now)
   const other = otherText(pl, s, now)
   const cols: Col[] = [
-    { label: 'Left before stop', value: pl.left === null ? '—' : `${pl.left}%`, sub: forecast.text, tone: toneOf(used(v, pl)) },
+    {
+      // While lending, the room is more than this PC's own limit: say so, and what its own limit alone would leave.
+      label: pl.isLending ? 'Left · with lent share' : 'Left before stop',
+      value: pl.left === null ? '—' : `${pl.left}%`,
+      sub: pl.isLending && pl.left !== null ? `own limit: ${Math.max(0, round1(pl.share - v.mine))}% left` : forecast.text,
+      tone: toneOf(used(v, pl)),
+    },
     { label: v.isCalibrated ? 'Last 15 min' : 'Last 15 min · learning', value: `+${v.mine15}%`, sub: `${fmtTokens(v.tokens15)} tok · ${fmtTokens(v.out15)} out` },
     { label: 'Other PC', value: other.value, sub: other.sub, tone: other.tone },
     { label: 'Account', value: v.pct === null ? '—' : `${v.pct}%`, sub: v.cost === null ? 'both PCs' : `$${v.cost.toFixed(2)} this session` },

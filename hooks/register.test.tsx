@@ -162,7 +162,7 @@ test('the other PC idle for 40 minutes lends its share', async ($, on) => {
   // 40% used, over its 30% share, but the other PC is idle: it may go to 90%.
   expect((await $.prompt.submit(PROMPT)).drop).toBe(undefined)
   const term = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect((await term.find({ type: 'Text', text: /Other PC/ }))?.text).toContain('lending to you')
+  expect((await term.find({ type: 'Text', text: /Other PC/ }))?.text).toContain('lends you')
   await term.unmount()
 })
 
