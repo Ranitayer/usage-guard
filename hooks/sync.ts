@@ -4,10 +4,9 @@ import type { PcStatus, Sync } from '../types'
 
 /** The private repo both PCs share sits next to this plugin's own repo: <owner>/usage-guard-sync. */
 export const SYNC_REPO = 'usage-guard-sync'
-// Some networks drop a share of connections to GitHub: each network call tries this many times, this long each.
-// A working connection to GitHub answers in well under a second, so a try that hangs is given up quickly.
-const TRIES = 6
-const TRY_TIMEOUT = 8_000
+// Each network try gets longer: a quick retry helps a network that drops connections, and the later, longer
+// ones leave room for a slow PC, where git and the GitHub CLI's sign-in helper take seconds just to start.
+const TRY_TIMEOUTS = [10_000, 20_000, 30_000, 45_000]
 // Local git work and a first clone may take longer than one network try.
 const LOCAL_TIMEOUT = 30_000
 // Never ask on a terminal or in a window: a PC without a sign-in just reads "not synced".
@@ -101,8 +100,8 @@ function serial<T>(st: SyncRepoState, fn: () => Promise<T>): Promise<T> {
 
 async function git($: EngineInterface, args: string[], network = false): Promise<string> {
   let err = ''
-  for (let i = 0; i < (network ? TRIES : 1); i++) {
-    const timeoutMs = network && args[0] !== 'clone' ? TRY_TIMEOUT : LOCAL_TIMEOUT
+  for (let i = 0; i < (network ? TRY_TIMEOUTS.length : 1); i++) {
+    const timeoutMs = network ? Math.max(TRY_TIMEOUTS[i]!, args[0] === 'clone' ? LOCAL_TIMEOUT : 0) : LOCAL_TIMEOUT
     const r = await $.process.run(['git', ...CRED, ...args], { env: GIT_ENV, timeoutMs }).catch((e: unknown) => {
       err = e instanceof Error ? e.message : String(e)
       return null
